@@ -1,0 +1,1896 @@
+#!/usr/bin/perl -w
+#
+# dnstool: Tool to update DNS based on some meta-data stored in DNS
+#    and user input.  Update is done with DNS-UPDATE
+#
+#    Copyright 2006,2010 Nicolai Langfeldt, Linpro AS
+#    Copyright 2012 Erik Inge Bolsø, Redpill Linpro AS
+#    Copyright 2006,2010,2012 Oslo Lufthavn AS
+#
+#    This file is part of dnstool.
+#
+#    dnstool is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    dnstool is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with dnstool.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+
+use Curses::UI;
+use Net::DNS;
+use Net::DNS::Update;
+use NetAddr::IP;
+use Data::Dumper;
+use Curses;
+use Carp;
+use subs qw(exit);
+# Do not use:
+# use utf8;
+
+use constant {
+  # Base opperation, add or delete?
+  ADD_RR => 1,
+  DEL_RR => 2,
+
+  # For adding A or CNAME outside our own set of networks
+  ADD_CNAME => -1,
+  ADD_OUTSIDE => -2,
+
+  # For deleting. Delete by name? Otherwise by by
+  # IP, PTR only.
+  DEL_NAME => -1,
+
+  # Wizard driver: Go to next "page"?
+  WIZ_NEXT => 1,
+  WIZ_PREV => -1,
+  WIZ_CANCEL => 0,	# As a rule this does program exit by itself
+
+  # network list, single choice or multiple choice?
+  LIST_SC => 0,
+  LIST_MC => 1,
+};
+
+my %ops = (
+  +ADD_RR, 'Add',
+  +DEL_RR, 'Delete'
+);
+
+my $default_ttl;
+my $default_domain;
+my $default_router;
+
+my $debug = 0;
+
+my $realyexit = 1;
+*exit =  sub { CORE::exit($realyexit) if $realyexit; 
+               goto choose_operation; };
+
+my $cui;	# Curses User Interface object.  Only makes sense as a
+                # global.
+my %nwdesc;	# Hash of subnet descriptions
+my %router;	# Routers indexed by prefix/mask
+
+# Some setup to allow us to see messages ...  does not appear to work
+# too well :-(
+
+sub printwarn {
+    $cui->leave_curses if defined($cui);
+    print join('',@_);
+    if (open(LOGFIL,">>".$ENV{'HOME'}."/dnstool.log")) {
+	print LOGFIL join('',@_);
+	close(LOGFIL);
+    } else {
+	print "Error opening logfile: $!";
+    }
+    $cui->reset_curses if defined($cui);
+}
+
+sub printnolog {
+    $cui->leave_curses if defined($cui);
+    print join('',@_);
+    $cui->reset_curses if defined($cui);
+}
+
+
+sub printlog {
+    if (open(LOGFIL,">>".$ENV{'HOME'}."/dnstool.log")) {
+	print LOGFIL join('',@_);
+	close(LOGFIL);
+    } else {
+	printwarn "Error opening logfile: $!\n";
+    }
+}
+
+
+sub printmsg {
+  $cui->leave_curses if defined($cui);
+  print join('',@_);
+    if (open(LOGFIL,">>".$ENV{'HOME'}."/dnstool.log")) {
+	print LOGFIL join('',@_);
+	close(LOGFIL);
+    } else {
+	print "Error opening logfile: $!";
+    }
+  $cui->reset_curses if defined($cui);
+}
+
+# Misc signal and death handeling
+
+$SIG{__DIE__} = $SIG{__WARN__} = \&printwarn;
+
+$SIG{INT} = sub {
+  printwarn("Program interrupted by user.\n");
+  $realyexit = 1;
+  exit 1;
+};
+
+# ####################################################################
+# ###                         MAIN HERE                            ###
+# ####################################################################
+
+our $progress; 	# declare local() variable needed by drive_wizard;
+
+my $tool_server = &find_toolserver(\@ARGV);
+
+my $operation;
+
+my $lines;
+my $cols;
+
+# Instanciate UI library
+$cui = new Curses::UI (
+		       -mouse_support => 0,
+		       -clear_on_exit => 0,
+		      );
+
+# Do after Curses::UI initializes as it sets the variables for us.
+# And if it does not default them.
+if (defined($ENV{'LINES'})) {
+  $lines=$ENV{'LINES'};
+} else {
+  $lines=24;
+}
+
+if (defined($ENV{'COLS'})) {
+  $cols=$ENV{'COLS'};
+} else {
+  $cols=80;
+}
+
+# Print $lines lines to get cursor into lower left corner for sure.
+# The effect is that things printed by the program (with printwarn and
+# printmsg or wrapped likewise in leave_curses/reset_curses) is
+# readable at program exit.
+
+printnolog "\r\n"x($lines+5);
+
+if ($cols < 80) {
+  printwarn "I will need at least 80 columns to work, I now have $cols\r\n";
+  exit 1;
+}
+
+if ($lines < 24) {
+  printwarn "I will need at least 24 columns to work, I now have $lines\r\n";
+  exit 1;
+}
+
+# printmsg("Commandline command: /".join('/ /',@ARGV)."/\n");
+
+printlog("dnstool started at ".scalar(localtime())."\n");
+
+choose_operation:
+ $realyexit=1;
+ ($tool_server,$operation) = &choose_operation(\@ARGV,$tool_server);
+
+if ($operation == -1) {
+    exit 0;
+} elsif ($operation == ADD_RR) {
+    $realyexit = 0;
+    &add_wizard(\@ARGV,$tool_server);
+} elsif ($operation == DEL_RR) {
+    $realyexit = 0;
+    &del_wizard(\@ARGV,$tool_server);
+}
+
+goto choose_operation;
+
+# ####################################################################
+# ###                      HELP PROCEDURES                         ###
+# ####################################################################
+
+sub find_toolserver {
+    # Find the nameserver authoritative for the dnstool zones,
+    # could be that the user said the name on the commandline.
+    my($argv)=shift;
+
+    # PRODUCTION USE:
+    if (defined(${$argv}[0])) {
+	if ( (${$argv}[0] eq 'srv' or
+	      ${$argv}[0] eq 'server' or
+	      ${$argv}[0] eq 'ser') ) {
+	    shift(@{$argv});
+	    if (defined(${$argv}[0])) {
+		return shift(@{$argv});
+	    } else {
+		die "server argument not followed by name server name!\n";
+	    }
+	}
+    }
+
+    my $firstres = Net::DNS::Resolver->new(recurse => 1,
+					   debug => 0);
+
+    die if !defined $firstres;
+
+    # Get tool-server name
+    my $toolserver = get_txt($firstres,'toolmaster.policy.dnstool');
+
+    die "Could not find dnstool server!\n" unless defined($toolserver);
+
+    return $toolserver;
+};
+
+
+# ######################## Load policies/defaults ######################
+
+sub search_A {
+  # Get A record with the given name via the given resolver
+
+  my ($res) = shift;
+  my ($name) = shift;
+
+  my ($query) = $res->search($name,'A');
+
+  unless ($query) {
+    printwarn ("Couldn't look up \"$name\" A record\n");
+    return undef;
+  }
+
+  foreach my $rr ($query->answer) {
+    next unless $rr->type eq 'A';
+
+    return $rr->address;
+  }
+  return undef;
+}
+
+
+sub get_txt {
+  # Get TXT record with the given name via the given resolver
+
+  my ($res) = shift;
+  my ($name) = shift;
+
+  my ($query) = $res->query($name,'TXT');
+
+  unless ($query) {
+    printwarn ("Couldn't look up \"$name\" TXT record\n");
+    return undef;
+  }
+
+  foreach my $rr ($query->answer) {
+    next unless $rr->type eq 'TXT';
+
+    return $rr->txtdata;
+  }
+  return undef;
+}
+
+sub load_policy {
+  my ($res) = shift;
+
+  $default_router = get_txt($res,'router.policy.dnstool');
+  # Net::DNS has a long timeout, die semi-early if something is wrong
+  die ("Could not look up router policy, is tool server defined correctly?\n") unless defined ($default_router);
+  $default_ttl = get_txt($res,'ttl.policy.dnstool');
+  $default_domain = get_txt($res,'dnsdomain.policy.dnstool');
+}
+
+# ############################ Update DNS ##############################
+
+sub update_dns {
+  # Attempt to update DNS.  Handle all errors here.  Fatal errors
+  # results in termination.  Lesser errors in a return value of 0.  No
+  # error returns in a return value of 1.
+
+  my($res) = shift;	# Resolver handle.
+  my($domname) = shift; # Use this to figure out the name of the domain
+  my($dnsop) = shift;   # Name of operation for logging
+
+  my $op;
+  my $value;
+  my $updatedom ='';
+
+  # This sends a query and we get back the answer even if the query
+  # itself fails.  Either we get the answer or we glean it indirectly
+  # from the authority section of the failed answer.  Ask for the SOA
+  # of a FQDN hostname (existent or not) and you'll get back a
+  # authority section giving away the dname of the actuall domain that
+  # needs to be updated.
+  my ($query) = $res->send($domname,'SOA','IN');
+
+  if ($query) {
+    foreach my $rr (($query->answer,$query->authority)) {
+      next unless $rr->type eq 'SOA';
+
+      $updatedom = $rr->name;
+    }
+  }
+
+  # If the query failed to find the correct SOA then we're SOL.
+  if (!$updatedom) {
+    $cui->dialog("Error: Cannot find the SOA of the
+domain $domname belongs in.
+
+Is the domain configured correctly?
+
+Press OK to end this operation.");
+    exit 1;
+  }
+
+  my ($update) = Net::DNS::Update->new($updatedom);
+
+  printlog("Updating domain $updatedom\n");
+
+  while (@_) {
+    $op = shift @_;
+    $value = shift @_;
+    $update->push($op,$value);
+    printlog("Operation: $op $dnsop ".$value->string."\n");
+  }
+
+  my ($reply) = $res->send($update);
+
+  if ($reply) {
+    if ($reply->header->rcode eq 'NOERROR') {
+      printlog("Update worked\n");
+      return 1;
+    } else {
+      printlog("Update failed: ".$reply->header->rcode."\n");
+      $cui->dialog('DNS update failed: '.$reply->header->rcode."\n");
+      return 0;
+     }
+  } else {
+    printlog("Update failed: ".$res->errorstring."\n");
+    $cui->dialog('DNS update failed: '.$res->errorstring."\n");
+    return 0;
+  }
+}
+
+# This generates a reverse DNS address from a IP number.  Or the opposite.
+
+sub revdns {
+  my $ip = shift;
+
+  if ($ip =~ s/\.in-addr\.arpa\.?$//) {
+    return join('.',reverse split('\.',$ip));
+  } else {
+    return join('.',reverse(split('\.',$ip)),'in-addr.arpa.');
+  }
+}
+
+# This sorts by IP-address in case something generates them in the wrong
+# order.  A DNS zone transfer is most often not ordered by IP for example
+
+sub bynetwork {
+  my($ann) = $a->name;
+  my($bnn) = $b->name;
+
+  my($cmp) = NetAddr::IP->new($ann) <=> NetAddr::IP->new($bnn);
+
+  if ($debug) {
+    my($c) = '==';
+
+    $c = '<' if ($cmp == -1);
+    $c = '>' if ($cmp == 1);
+
+    printwarn("Compared and found: $ann $c $bnn\n");
+  }
+
+  return $cmp;
+
+  # This is the short version, not to easy to debug.
+  # return NetAddr::IP->new($ann) <=> NetAddr::IP->new($bnn);
+}
+
+sub byinaddr {
+    # Sort list of labels that looks like this:
+    #     "   5.2.0.192.in-addr.arpa. 3600 IN PTR dnstooltest.example.example."
+    my ($aw)=$a; # Work copy of $a
+    my ($bw)=$b; # Work copy of $b
+
+    # REmove leading space
+    $aw =~ s/^\s+//;
+    $bw =~ s/^\s+//;
+    ($aw) = split(/\s+/,$aw,2);
+    ($bw) = split(/\s+/,$bw,2);
+
+    # Make a regular IP of it.
+    $aw = revdns($aw);
+    $bw = revdns($bw);
+
+    # Convert to IP objects and compare
+    my($cmp) = NetAddr::IP->new($aw) <=> NetAddr::IP->new($bw);
+
+    if ($debug) {
+	my($c) = '==';
+
+	$c = '<' if ($cmp == -1);
+	$c = '>' if ($cmp == 1);
+
+	printwarn("Compared and found: $aw $c $bw\n");
+    }
+
+    return $cmp;
+}
+
+
+sub fronttrunk {
+    # Sort helper that removes leading space
+    my ($aw) = $a;
+    my ($bw) = $b;
+    $aw =~ s/^\s+//;
+    $bw =~ s/^\s+//;
+    return $aw cmp $bw;
+}
+
+sub dnsrrstr {
+    my $rr = shift;
+    my $data = '';
+
+    if (defined($data=$rr->rdatastr) || $data) {
+	# OK fine
+    } else {
+	$data="; no data available";
+    }
+
+    return sprintf("%25s %6d %2s %-5s %s",$rr->{'name'},$rr->{'ttl'},
+		   $rr->{'class'},$rr->{'type'},$data);
+
+}
+
+# ####################################################################
+# ###                      USER INTERACTION                        ###
+# ####################################################################
+
+# ###################### Listbox wizard and accessories ####################
+
+sub filter_network_list ($$) {
+  my $str=lc shift;  # Filter string
+  my $al=shift;      # Reference to hash of all list-labels, indexed by $i
+
+  # Selected values, labels, and their prefixes by index
+  my @selvalues;
+
+  if ($str eq '') {
+    # Zero search expression, optimized
+    @selvalues = sort {$a <=> $b} keys %{$al};
+    print Dumper \@selvalues if $debug>=2;
+    return \@selvalues;
+  }
+
+  my $i;
+  my $label;
+
+  foreach $i (sort {$a <=> $b} keys %{$al}) {
+    $label = lc $al->{$i};
+    printmsg("looking for $str in $i: $label\n") if $debug;
+    next if index($label,$str) < 0;
+    push(@selvalues,$i);
+  }
+  return \@selvalues;
+}
+
+
+sub listbox_wizard ($$$$$$$) {
+  # Present a listbox to choose one thing from.  This procedure should
+  # have no domain knowledge of DNS, it's a pure interface procedure.
+
+  # The dialog is part of a wizard and has prev, next and cancel
+  # buttons.  There is a filter input field.
+
+  # There are two major modes of operation: 
+  # +LISTSC: Single choice
+  #   The return value is a tuple of ($button, $selected_line_index).
+  #   The caller must keep account of what was represented on
+  #   $selected_line_index.
+  # +LISTMC: Multiple choice
+  #   The return value is a tuple of ($button, \@selected_line_indexes);
+
+  # Listbox contents
+  my $listboxmode = shift;
+  my $labels = shift;
+  my $values = shift;
+  my $initfilter = shift;
+
+  # Titles and legends
+  my $windowtitle = shift;
+  my $windowlegend = shift;
+  my $listtitle = shift;
+  my $listmulti = 0;
+
+  $listmulti = 1 if $listboxmode == +LIST_MC;
+
+  my $win = $cui->add('listbox_window','Window',
+		      '-border' => 1,
+		      '-ipad' => 1,
+		      '-height' => $lines,
+		      '-width' => $cols,
+		      '-centered' => 1,
+ 		      '-title' => $windowtitle );
+
+  $win->add(undef,'Label',
+	    '-x' => 1, '-y' => 0,
+	    '-text' => $windowlegend );
+
+  my $lb =
+    $win->add(undef,'Listbox',
+	      '-y' => 2,
+	      '-width' => $cols-2,
+	      '-padbottom' => 2,
+	      '-border' => 1,
+	      '-title' => $listtitle,
+	      '-vscrollbar' => 1,
+	      '-multi' => $listmulti,
+	      '-values' => $values,
+	      '-labels' => $labels,
+	     );
+
+  my $lastfilter = $initfilter;
+  my $nowfilter;
+
+  my $filter =
+    $win->add(undef,'TextEntry',
+	      '-x' => 10, '-y' => $lines-5, -width => 25,
+	      '-reverse' => 1,
+	      '-tolower' => 1, # lowercase since filter is case-insensitive
+	      '-text' => $initfilter,
+	      '-singleline' => 1,
+	      '-onChange'=>sub {
+		# This gets called too often so check if any change is needed
+		$nowfilter = shift->get;
+		if ($nowfilter ne $lastfilter) {
+		  $lb->values(filter_network_list($nowfilter,$labels));
+		  $lb->draw;
+		  $lastfilter = $nowfilter;
+		};
+	      }
+	     );
+
+  $win->add(undef,'Label',
+	    '-x' => 0, '-y' => $lines-5,
+	    -text => 'Filter: ');
+
+  my $buttons =
+    $win->add('choiceButtons','Buttonbox',
+	      '-x' => 42, '-y' => $lines-5,
+	      '-selected' => 1,
+	      '-buttons' =>
+	      [ { '-label' => '<< Previous ',
+		  '-value' => +WIZ_PREV,
+		  '-shortcut' => 'p',
+		  '-onpress' => sub { $win->loose_focus; }, },
+		{ '-label' => ' Next >>',
+		  '-value' => +WIZ_NEXT,
+		  '-color' => 'green',
+		  '-shortcut' => 'n',
+		  '-onpress' => sub { $win->loose_focus; }, },
+		{ '-label' => '< Cancel >',
+		  '-shortcut' => "\x1B", # ESC
+		  '-value' => +WIZ_CANCEL,
+		  '-onpress' => sub { $cui->delete('listbox_window'); 
+				      exit 1; }, },
+	      ],
+	     );
+
+  # Users that filter out all choices and then press "ok" are thrown
+  # back here after being told off.
+ listselect:
+  $lb->focus;
+  $win->modalfocus;
+
+  my $sel;
+
+  if ($listboxmode == +LIST_SC) {
+      # Get returns a line that the user has selected by pressing
+      # enter or some such. Makes little sense in a box with a single
+      # selection value and no optical selection marker.  Therefore we
+      # get the line which currently has the highlight/"cursor".
+
+      $sel = $lb->get_active_value;
+
+      # The list was empty when the user exited
+      if (!defined($sel)) {
+	  $cui->dialog("You have to select something, or cancel");
+	  # Reset the filter
+	  $filter->text($initfilter);
+	  $lb->values(filter_network_list($initfilter,$labels));
+	  $lb->draw;
+	  goto listselect;
+      }
+
+  } else {
+      # Multichoice list.  Get list of selections
+      my (@sel) = $lb->get;
+
+      if ($#sel < $[) {
+	  $cui->dialog("You have to select something, or cancel");
+	  $filter->text($initfilter);
+	  $lb->values(filter_network_list($initfilter,$labels));
+	  $lb->draw;
+	  goto listselect;
+      }
+      $sel = \@sel;
+  }
+
+  my $button = $buttons->get;
+
+  $cui->delete('listbox_window');
+
+  return ($button,$sel);
+}
+
+# ############# To Add or to Delete that is the question #############
+
+sub choose_operation ($) {
+  my($argv)=shift;
+  my($server)=shift;
+
+  # Check commandline first
+  if (defined(${$argv}[0])) {
+    if (${$argv}[0] eq 'add') {
+      shift(@{$argv});
+      return ($server,ADD_RR);
+    } elsif (${$argv}[0] eq 'del' or ${$argv}[0] eq 'delete') {
+      shift(@{$argv});
+      return ($server,DEL_RR);
+    };
+  };
+
+  # Nought on commandline, present choice box
+  my($win) = $cui->add('select_ops_window','Window',
+		       -border => 1,
+		       -ipad => 1,
+		       -height => 13,
+		       -width => 50,
+		       -centered => 1,
+		       -title => "DNS tool: Choose an operation");
+
+  $win->add(undef,'Label',
+	    '-x' => 1, '-y' => 1,
+	    '-text' => "Add or remove DNS record?");
+
+  my $buttons =
+    $win->add(undef,'Buttonbox',
+	      '-x' => 1, '-y' => 4,
+	      '-buttons' => [
+			     { -label => '< Add >',
+			       -shortcut => 'a',
+			       -value => ADD_RR,
+			       -onpress => sub { $win->loose_focus; }, },
+			     { -label => '< Delete >',
+			       -value => DEL_RR,
+			       -shortcut => 'd',
+			       -onpress => sub { $win->loose_focus; }, },
+			     { -label => '< Exit >',
+			       -value => -1,
+			       -shortcut => "\x1B", # Escape
+			       -onpress => sub { $win->loose_focus; }, },
+			    ],
+	     )->focus;
+
+  $win->add(undef,'Label',
+	    '-x' => 1, '-y' => 7,
+	    '-text' => "DNS-tool server:");
+
+  my $servereditor =
+    $win->add('server','TextEntry',
+	      '-x' => 18, '-y' => 7, -width => 25,
+	      '-reverse' => 1,
+	      '-tolower' => 1,
+	      '-singleline' => 1,
+	      -text => $server);
+
+  $win->modalfocus;
+  my (@return) = ($servereditor->text, $buttons->get);
+
+  $cui->delete('select_ops_window');
+
+  return @return;
+}
+
+# ######################### NETWORK SELECTOR ###########################
+
+sub network_list ($$) {
+  # Present dialog with listbox of all available networks.  This is used
+  # to select what network to add addresses into or delete from
+
+  # Bypass this if the user has given conclusive commandline input.
+
+  my ($argv)=shift;
+  my ($res)=shift;
+
+  # List of networks one can add addresses to
+  my (@zone) = $res->axfr('networks.dnstool');
+
+  if (!@zone) {
+    $cui->dialog("DNS problem:\nUnable to retrieve networks.dnstool:\n".
+		 $res->errorstring."\n");
+    $realyexit=1;
+    exit 1;
+  }
+
+  my @index;	# $i -> prefix/mask mapping
+  my %labels;	# The lines/labels that may appear in a listbox (see @index)
+  my $values;	# Reference to list of indexes that are to appear in listbox
+
+  my $i;	# @index iterator
+  my $rr;	# Resource iterator
+
+  my $nn;	# Resource "name" (actually 'label or name')
+  my @networks;
+  my $initfilter=''; # Initial network filter setting
+
+  my $button;	# What button was pressed to exit dialog?
+  my $sel;	# And what line was selected?
+
+  foreach $rr (@zone) {
+    $nn = $rr->name;
+    $nn =~ s/.networks.dnstool//;
+
+    # We'll need the routers later
+    if ($rr->type eq 'A' and $nn =~ s/^router.//) {
+      $router{$nn} = $rr->address;
+      next;
+    }
+
+    next unless $rr->type eq 'TXT';
+
+    # New record that requires less work later
+    $rr = Net::DNS::RR->new($nn.' 5 TXT "'.$rr->txtdata.'"');
+
+    push(@networks,$rr);
+  }
+
+  @networks = sort bynetwork @networks;
+
+  $i=0;
+  foreach $rr (@networks) {
+    $nn = $rr->name;
+
+    $index[$i]=$nn;
+    $nwdesc{$nn}=$rr->txtdata;
+
+    $labels{$i}=sprintf('%20s  %s',$nn,$rr->txtdata);
+    $i++;
+  }
+
+  if ($operation == +ADD_RR) {
+      $labels{+ADD_CNAME} = 'Add name based alias (a CNAME record)';
+      $labels{+ADD_OUTSIDE} = 'Add address based alias (an A record)';
+  } else {
+      $labels{+DEL_NAME} = 
+	sprintf('%20s  %s',$default_domain,'Forward domain');
+  }
+
+  # Check commandline
+  if (defined($argv->[0])) {
+    if ($argv->[0] eq 'network' or $argv->[0] eq 'nw') {
+      shift(@{$argv});
+      if (defined($argv->[0])) {
+	$initfilter = shift(@{$argv});
+      } else {
+	printwarn "The network/nw commandline option needs a initial value\n";
+	$realyexit=1;
+	exit 1;
+      }
+    } elsif ($operation == +ADD_RR and
+	     ($argv->[0] eq 'cname' or
+	      $argv->[0] eq 'alias')) {
+      shift(@{$argv});
+      return (+WIZ_NEXT,+ADD_CNAME);
+    } elsif ($operation == +ADD_RR and
+	     ($argv->[0] eq 'aalias'
+	      or $argv->[0] eq 'outsidea')) {
+      shift(@{$argv});
+      return (+WIZ_NEXT,+ADD_OUTSIDE);
+    } elsif ($operation == +DEL_RR and $argv->[0] eq 'domain') {
+	shift(@{$argv});
+	return (+WIZ_NEXT,+DEL_NAME);
+    }
+  }
+
+  ($values) = filter_network_list($initfilter,\%labels);
+
+  if ($initfilter and @{$values} == 1) {
+    # Check if user gave un-ambigous name of network to allocate from
+    return (+WIZ_NEXT, $values->[0]);
+  }
+
+  if ($operation == +ADD_RR) {
+      ($button,$sel) =
+	listbox_wizard(+LIST_SC,\%labels,$values,$initfilter,
+		       "DNS tool: ".$ops{$operation}." an address",
+		       "Choose a network",
+		       sprintf("%19s  %s",'Prefix','Description')
+		      );
+  } else {
+      ($button,$sel) =
+	listbox_wizard(+LIST_SC,\%labels,$values,$initfilter,
+		       "DNS tool: ".$ops{$operation},
+		       "Choose where to delete from",
+		       sprintf("%19s  %s",'Prefix','Description')
+		      );
+  }
+
+  if ($sel<0) {
+    return ($button,$sel);
+  } else {
+    return ($button,$index[$sel]);
+  }
+}
+
+# ###################### SELECT ADDRESS FROM SUBNET ######################
+
+sub show_subnet_list ($$$) {
+  # Present list of addresses in subnet to select from.  This can be
+  # used for deleting or adding DNS records.
+
+  # In the case of adding addresses the initfilter is 'not used' to
+  # show only available addresses.
+
+  # When deleting the "not used" should be removed from the selection
+  # list entirely - here, before the listbox procedure is called.
+  # ALSO one should use a checkbox-listbox to enable the user to
+  # choose several addresses to delete.
+
+  # Return a tuple of ($button,$name-to-add,$address)
+
+  my ($argv)=shift;
+  my ($res)=shift;	# DNS Resolver handle
+  my ($network)=shift;	# Network to add into such as: '10.176.1.0/24'
+
+  my $values;	# Reference of the list of values to show in the listbox
+  my %labels;	# Listbox labels hashes by "value" (an integer)
+  my @labels;   # Label list used when generating deletion list
+  my %ipnumber; # Hash of ip-number strings by "value"
+  my $i=0;	# Value iterator for building label hash.
+  my $ip;	# Network-address iterator (NetAddr::IP object)
+  my $ips;	# Network-address stringifyed
+  my $query;	# Server query
+  my $rr;	# DNS query iterator
+  my $initfilter='not used';
+  my $net = new NetAddr::IP $network; # Network we're adding to.
+  my $onet = $net;
+  my @nets=();	# Networks to itterate over (if more than 8 bits of subnet)
+  my $axfrnet;  # NetAddr::IP network object that we want zonetransfer of
+  my @axfroctets; # The octets of that net
+  my %reverse=(); # Reverse lookup hash gathered in-addr.arpa AXFRs.
+  my $ptr;	# A string containg some reverse lookup info
+
+  # "Please wait" message.  For /24 networks the user will not notice
+  # it.  For /16 and /8 he or she will notice it.
+
+  $cui->status(<<"EOM");
+Retriving reverse lookup information
+and generating subnet list.
+
+Please wait.
+EOM
+
+  # We're faced with one of three cases:
+  # 1. The selected network and the reverse zone are the same size
+  # 2. The reverse zone is larger than the selected network
+  # 3. The selected network is larger than the reverse zone
+  #
+  # Case 1 and 2 will be handled the same.
+
+  my $reverse = revdns($net->addr);
+  my $reversezone = '';
+#  printlog "Reverse name suggestion: $reverse\n";
+
+  # Obtain SOA from the best match for the reverse name
+  $query = $res->send($reverse,'SOA','IN');
+
+  if ($query) {
+    foreach my $rr (($query->answer,$query->authority)) {
+#      printlog "Record: ".$rr->string."\n";
+      next unless $rr->type eq 'SOA';
+      # Reversezone will end in .in-addr.arpa.
+      $reversezone = $rr->name;
+      last;
+    }
+  }
+
+  # Reverse zone netmask width.
+  my $revw;
+
+  if ($reversezone =~ m/\.in-addr\.arpa$/) {
+    my $forw = revdns($reversezone);
+    # Find number of dots.
+    $revw = ($forw =~ s/\.//g);
+    $revw = 0 if !defined($revw);
+    # There are 1 more octets than dots
+    $revw++;
+    # Multiply by 8 to obtain netmask width
+    $revw *= 8;
+  } else {
+    $cui->dialog("There does not appear to be a reverse
+zone for the selected network: ".$net->cidr."
+
+Please tell your DNS admin to add one.
+
+Press OK to return to the network list");
+    return (+WIZ_PREV,undef);
+  }
+
+  printlog "*****The size of the reverse network mask is $revw\n";
+  printlog "*** Subnet size is ".$net->masklen."\n";
+  printlog "Reverse zone is ".revdns($reversezone)."\n";
+  printlog "Network is ".$net->cidr."\n";
+
+  # So how does the subnet and the available reverse zone match?
+  if ($revw < $net->masklen) {
+    printlog "Revzone is larger than subnet: $revw < ".$net->masklen."\n";
+    my $revnet = new NetAddr::IP( revdns($reversezone).'/'.$revw );
+    printlog "Reverse network is ".$revnet->cidr."\n";
+    @nets = ( $revnet );
+  } elsif ( $revw == $net->masklen) {
+    printlog "Revzone and subnet are the same\n";
+    @nets = ($net);
+  } else {
+    printlog "Splitting subnet into smaller reverse nets\n";
+    # Split the large subnet into reverse-zone sized networks
+    @nets = $net->split($revw);
+  }
+
+  # Generate list of IP-addresses in specified network to present in
+  # list dialog.
+
+  my @query;
+
+  foreach $net (@nets) {
+
+    ### First we fetch the reverse zone for the "current" network
+
+    # This should not be needed, we already figured the size of the
+    # reverse zone.
+    # if ($net->masklen>24) {
+      # Too small for zone-transfer.  Generate correct subnet-address
+      # for zone transfer.
+      # my $largenet = new NetAddr::IP ($net->addr.'/24');
+      # $axfrnet = new NetAddr::IP $largenet->network;
+    # } else {
+
+    $axfrnet = $net;
+
+    # }
+
+    # Ok, exactly what is the "in-addr.arpa name" now again?
+    @axfroctets = split(/\./,$axfrnet->addr);
+    pop(@axfroctets) if $axfrnet->masklen<=24;
+    pop(@axfroctets) if $axfrnet->masklen<=16;
+    pop(@axfroctets) if $axfrnet->masklen==8;
+    $axfrnet = join('.',reverse @axfroctets).'.in-addr.arpa.';
+
+    printlog "Zone transfer network name $axfrnet\n";
+
+    # Do zone transfer
+    @query = $res->axfr($axfrnet);
+
+    if (!@query) {
+      $cui->dialog("There is no reverse zone backing the
+selected network: ".$onet->cidr."
+
+Did not find $axfrnet
+
+Press OK to end this operation.");
+      printlog("Reverse zone $axfrnet is missing\n");
+      exit 1;
+    }
+
+    if ($operation == +ADD_RR) {
+      # Hash up the used names in the reverse zone
+      foreach $rr (@query) {
+	if ($rr->type eq 'PTR') {
+	  $ips = revdns($rr->name);
+	  $reverse{$ips} = $rr->ptrdname;
+	}
+      }
+    } else {
+      # $operation == +DEL_RR
+      # Just present user with records to delete
+      foreach $rr (@query) {
+	# Show everything but SOA
+	next if $rr->type eq 'SOA';
+	push(@labels, dnsrrstr($rr));
+      }
+    }
+  } # foreach $net (@nets)
+
+  if ($operation == +DEL_RR) {
+      $initfilter ='';
+      # Sort the labels in a comprehensible way
+      map { $labels{$i++} = $_; } (sort byinaddr @labels);
+  } else {
+      # Ok, we know the reverse values, time to generate the list-box list
+      for $ip (@$onet) {
+        $ips = $ip->addr;
+
+        # Figure the reverse
+        if (defined($reverse{$ips})) {
+	  $ptr = $reverse{$ips};
+        } else {
+	  $ptr = 'not used';
+        }
+
+        $labels{$i} = sprintf("%15s  %s",$ips,$ptr);
+        # xxx.xxx.xxx.xxx = 15 characters
+        $ipnumber{$i}=$ips;
+        $i++;
+      }
+  }
+
+  ($values) = filter_network_list($initfilter,\%labels);
+
+  $cui->nostatus;
+
+  my $button;
+  my $sel;
+
+  if ($operation == +ADD_RR) {
+
+      ($button,$sel) =
+	listbox_wizard(+LIST_SC,\%labels,$values,$initfilter,
+		       "DNS tool: ".$ops{$operation},
+		       "Choose an IP-address from $network ".$nwdesc{$network},
+		       sprintf("%14s  %s",'Address','Description'));
+
+      return ($button,undef) if $button == +WIZ_PREV;
+
+      $sel = $ipnumber{$sel};
+
+      return ($button,$sel);
+  } else {
+      if ($i == 0) {
+	  # So we found exactly no records to delete
+	  $cui->dialog("There are no records to delete in this network.
+
+Press OK to return to the network selector");
+	  return (+WIZ_PREV,undef);
+      }
+
+      my @sel;
+
+      ($button,$sel) =
+	listbox_wizard(+LIST_MC,\%labels,$values,$initfilter,
+		       "DNS tool: ".$ops{$operation},
+		       "Choose one or more IP-addresses from $network ".$nwdesc{$network},
+		       sprintf("%14s  %s",'Address','Description'));
+
+      return ($button,undef) if $button == +WIZ_PREV;
+
+      @sel = map { $labels{$_}; } @{$sel};
+
+      return ($button,\@sel);
+  }
+}
+
+
+sub show_domain_list ($$) {
+    # Delete record by domainname
+    my ($argv) = shift;
+    my ($res) = shift;
+
+    my $values;
+    my @labels;
+    my %labels;
+    my $i=0;
+    my $button;
+    my $sel;
+    my @sel;
+
+    my (@query) = $res->axfr($default_domain);
+
+    if (!@query) {
+	$cui->dialog("Error zone transfering $default_domain:
+
+".$res->errorstring."
+
+Please tell your DNS admin.
+
+Press OK to end this program.");
+    }
+
+    # Allow the user to delete anything but a SOA.
+    map { push(@labels,dnsrrstr($_)); } (grep { $_->type ne 'SOA' } @query);
+
+    map { $labels{$i++}= $_; } (sort fronttrunk @labels);
+
+    if ($i == 0) {
+	$cui->dialog("There are no records in the zone
+$default_domain that you can delete.
+
+Press OK to return to the program.");
+	return (+WIZ_PREV,undef);
+    }
+
+    $values = filter_network_list('',\%labels);
+
+    ($button,$sel) =
+      listbox_wizard(+LIST_MC,\%labels,$values,'',
+		     "DNS tool: Delete a record",
+		     "Choose one or more records. PTRs matching choosen A records will be deleted.",
+		     "Domain name");
+
+    return ($button,undef) if $button == +WIZ_PREV;
+
+    my $tmp;
+
+    @sel = map { $tmp = $labels{$_}; $tmp =~ s/^\s+//; $tmp; } @{$sel};
+
+    my $rr;
+    my $rev;
+    my $query;
+    my $name;
+    my $rname;
+
+    # Look for matching reverse records to delete
+    foreach my $r (@sel) {
+	$rr = new Net::DNS::RR $r;
+	if ($rr->type eq 'A') {
+	    $rev = revdns($rr->rdatastr);
+	    $query = $res->query($rev,'PTR','IN');
+	    next unless $query;
+	    foreach my $revrr (grep { $_->type eq 'PTR' } $query->answer) {
+		# So, if the $rr and the $revrr are symmetrical A and
+		# PTR records then delete the $revrr.  This is not an
+		# option.
+		$name = $rr->name;
+		$rname = $revrr->rdatastr;
+
+		# Trailing . can kill a string comparison.
+		$name =~ s/\.$//;
+		$rname =~ s/\.$//;
+
+		if ($name eq $rname and
+		    $rr->address eq revdns($revrr->name)) {
+		    push(@sel,$revrr->string);
+		}
+	    }
+	}
+    }
+
+    return ($button,\@sel);
+}
+
+
+sub subnet_list_add ($$$) {
+  # We get here when the user has chosen one of
+  # - add network <network>
+  # - add alias (+ADD_CNAME)
+  # - add outside A (+ADD_OUTSIDE)
+
+  my ($argv)=shift;
+  my ($res)=shift;	# DNS Resolver handle
+  my ($network)=shift;	# Network to add into or +ADD_CNAME or +ADD_OUTSIDE
+  my ($prog)=shift;	# The previously selected button in case we just pass the buck
+
+  # At this point the wizard should tri-furbicate but the wizard driver does
+  # not support this.  Good luck.
+
+  if ($network eq +ADD_CNAME or $network eq +ADD_OUTSIDE) {
+    # Pass the buck in whatever direction it is going
+    return ($prog,'');
+  } else {
+    return show_subnet_list($argv,$res,$network);
+  }
+}
+
+sub list_del ($$$) {
+    # We get here when the user has chosen one of
+    # - Delete from $default_domain (+DEL_NAME)
+    # - Delete from a reverse domain (nework name passed)
+
+    my ($argv)=shift;
+    my ($res)=shift;
+    my ($network)=shift;	# Zone to delete from
+
+    if ($network eq +DEL_NAME) {
+	return show_domain_list($argv,$res);
+    } else {
+	return show_subnet_list($argv,$res,$network);
+    }
+}
+
+# ########################################################################
+# ###                    ADDING DIFFERENT RECORDS                      ###
+# ########################################################################
+
+sub add_record_inside_a {
+  my ($argv)=shift;
+  my ($res)=shift;		# Net::DNS resolver object
+  my ($network)=shift;		# Subnet to add to
+
+
+  my ($addresses)=shift;	# List of ip-addresses, there will only be one
+
+  my ($address)=shift @{$addresses};
+  my $revname = revdns($address);
+
+  my $hostname = ".$default_domain";
+  my $REdomain = quotemeta $default_domain;
+  my $ttl = $default_ttl;
+  my $denyptr = 0;
+  my $ptrname = '';
+  my $addptr = 1;
+  my $adda = 1;
+
+  # Check if the IP address already has a PTR
+  my ($query) = $res->query($revname,'PTR');
+  # If there is already a PTR record for the reverse name then deny any
+  # further inserts.
+  if ($query) {
+      $denyptr = 1;
+      $addptr = 0;
+      foreach my $rr (grep { $_->type eq 'PTR' } $query->answer) {
+	  $ptrname = $rr->ptrdname;
+      }
+  }
+
+ input_hostname:
+
+  my($win) = $cui->add('add_rr_window','Window',
+		       -border => 1,
+		       -ipad => 1,
+		       -height => 13,
+		       -width => 60,
+		       -centered => 1,
+		       -title => "DNS tool: Input name");
+
+  $win->add(undef,'Label',
+	    '-x' => 1, '-y' => 0,
+	    '-text' => "Please fill in hostname and TTL");
+
+  my $nameeditor =
+    $win->add('dnsname','TextEntry',
+	      '-x' => 1, '-y' => 2, '-width' => 25,
+	      '-reverse' => 1,
+	      '-singleline' => 1,
+	      '-regexp' => '/^[-a-z0-9\.]+$/i',
+	      '-text' => $hostname)->focus;
+
+  my $ttleditor =
+    $win->add('dnsttl','TextEntry',
+	      '-x' => 27, '-y' => 2, '-width' => 7,
+	      '-reverse' => 1,
+	      '-singleline' => 1,
+	      '-regexp' => '/^\d+$/',
+	      '-text' => $ttl);
+
+  $win->add(undef,'Label',
+	    '-x' => 35, '-y' => 2,
+	    '-text' => "IN A $address");
+
+  my $buttons =
+    $win->add(undef,'Buttonbox',
+	      '-x' => 1, '-y' => 4,
+	      '-selected' => 1,
+	      '-buttons' => [
+			     { '-label' => '<< Previous ',
+			       '-value' => +WIZ_PREV,
+			       '-shortcut' => 'p',
+			       '-onpress' => sub { $win->loose_focus; }, },
+			     { '-label' => ' Finish >>',
+			       '-shortcut' => 'f',
+			       '-value' => +WIZ_NEXT,
+			       '-onpress' => sub { $win->loose_focus; }, },
+			     { '-label' => '< Cancel >',
+			       '-value' => +WIZ_CANCEL,
+			       '-shortcut' => "\x1B",
+			       '-onpress' => sub { 
+				   $cui->delete('add_rr_window');
+				   exit 1; }, },
+			    ],
+	     );
+
+  my ($makea) =
+    $win->add('makeA','Checkbox',
+	      '-x' => 1, '-y' => 6,
+	      '-label' => 'Create A record',
+	      '-checked' => $adda);
+
+  my $makeptr;
+
+  if ($denyptr) {
+      $win->add(undef,'Label',
+		'-x' => 1, '-y' => 8,
+		'-text' => "$address already has a PTR: $ptrname");
+  } else {
+      $makeptr =
+	$win->add('makerev','Checkbox',
+		  '-x' => 1, '-y' => 8,
+		  '-label' => 'Create PTR record',
+		  '-checked' => $addptr);
+  }
+
+  $win->modalfocus;
+
+  my $button = $buttons->get;
+  $hostname = $nameeditor->get;
+  $ttl = $ttleditor->get;
+  $addptr = $makeptr->get unless $denyptr;
+  $adda = $makea->get;
+  $cui->delete('add_rr_window');
+
+  return $button if $button == +WIZ_PREV;
+
+  if (!$addptr and !$adda) {
+      $cui->dialog("You don't want to create anything?
+
+Press Cancel in the window to end this program.
+
+Press OK to return to the window.");
+      goto input_hostname;
+  }
+
+  # User said to continue.  Check quality of input
+  if (! ($hostname =~ /^(?:[a-z0-9][a-z0-9-]*\.?)+$REdomain$/oi)) {
+    $cui->dialog("'$hostname' is not a legal hostname.
+
+Please enter a legal hostname of the form
+foo.$default_domain or foo.bar.$default_domain.
+
+Legal characters are 'a-z', 'A-Z', '0-9'
+and '-'.  '.' may only be used to separate
+characters/numbers in a name.");
+    goto input_hostname;
+  }
+
+  my ($PTRresult)=1;
+  my ($Aresult)=1;
+
+  if ($addptr) {
+    # Add PTR record as well as A
+    $PTRresult =
+      update_dns($res,$revname,"add",
+		 pre => nxrrset("$revname PTR"),
+		 update => rr_add("$revname $ttl PTR $hostname"));
+  }
+
+  if ($PTRresult and $adda) {
+    # Skip A installation if PTR installation failed.
+    $Aresult =
+      update_dns($res,$hostname,"add",
+		 pre => nxrrset("$hostname A"),
+		 update => rr_add("$hostname $ttl A $address"));
+  }
+
+  if ($PTRresult and $Aresult) {
+    my ($msg) = "Successfully added\n\n";
+
+    $msg .= "  $hostname $ttl A $address\n\n" if $adda;
+
+    $msg .= "and\n\n" if $adda and $addptr;
+
+    $msg .= "  $revname $ttl PTR $hostname\n\n" if $addptr;
+
+    $msg .= "to DNS. ";
+
+    my ($IPn) = new NetAddr::IP $network;
+
+    if (defined $router{$IPn->addr}) {
+      $msg .= "The default router on that network
+is ".$router{$IPn->addr}.".";
+    } else {
+      my($router) = new NetAddr::IP $network;
+      $router += $default_router;
+      $msg .= "There is no default router defined
+on that network, but the policy says it
+should be ".$router->addr.".";
+    }
+
+    $msg .= "\n\nPress OK to end this operation.";
+
+    $cui->dialog($msg);
+
+    exit 0;
+
+  } else {
+    # Undo whatever succeeded:
+
+    update_dns($res,$hostname,"delete",
+	       update => rr_del("$hostname A $address"))
+      if $Aresult;
+
+    update_dns($res,$revname,"delete",
+	       update => rr_del("$revname PTR $hostname"))
+      if $PTRresult;
+
+    $cui->dialog("As the update failed it has now been undone.
+
+Press OK to end this operation.");
+    exit 1;
+  }
+
+  # We should never get here.
+  exit 1;
+}
+
+
+sub add_record_cname {
+  my ($argv)=shift;
+  my ($res)=shift;		# Net::DNS resolver object
+  my ($addresses)=shift;	# List of ip-addresses, there will only be one
+
+  my ($address)=shift @{$addresses};
+
+  my $hostname = ".$default_domain";
+  my $REdomain = quotemeta $default_domain;
+  my $ttl = $default_ttl;
+  my $cname = '.';
+
+  my $checkres = Net::DNS::Resolver->new(recurse => 1,
+					 debug => 0);
+
+ input_cname:
+  my($win) = $cui->add('add_rr_window','Window',
+		       -border => 1,
+		       -ipad => 1,
+		       -height => 9,
+		       -width => 75,
+		       -centered => 1,
+		       -title => "DNS tool: Add CNAME");
+
+  $win->add(undef,'Label',
+	    '-x' => 1, '-y' => 0,
+	    '-text' => "Please fill in hostname, TTL and definition.  All names must be FQDN");
+
+  my $nameeditor =
+    $win->add('dnsname','TextEntry',
+	      '-x' => 1, '-y' => 2, '-width' => 25,
+	      '-reverse' => 1,
+	      '-singleline' => 1,
+	      '-regexp' => '/^[-a-z0-9\.]+$/i',
+	      '-text' => $hostname)->focus;
+
+  my $ttleditor =
+    $win->add('dnsttl','TextEntry',
+	      '-x' => 27, '-y' => 2, '-width' => 7,
+	      '-reverse' => 1,
+	      '-singleline' => 1,
+	      '-regexp' => '/^\d+$/',
+	      '-text' => $ttl);
+
+  $win->add(undef,'Label',
+	    '-x' => 35, '-y' => 2,
+	    '-text' => "IN CNAME");
+
+  my $cnameeditor =
+    $win->add('dnscname','TextEntry',
+	      '-x' => 44, '-y' => 2,
+	      '-reverse' => 1,
+	      '-singleline' => 1,
+	      '-regexp' => '/^[-a-z0-9\.]+$/i',
+	      '-text' => $cname);
+
+  my $buttons =
+    $win->add(undef,'Buttonbox',
+	      '-x' => 1, '-y' => 4,
+	      '-selected' => 1,
+	      '-buttons' => [
+			     { '-label' => '<< Previous ',
+			       '-value' => +WIZ_PREV,
+			       '-shortcut' => 'p',
+			       '-onpress' => sub { $win->loose_focus; }, },
+			     { '-label' => ' Finish >>',
+			       '-shortcut' => 'f',
+			       '-value' => +WIZ_NEXT,
+			       '-onpress' => sub { $win->loose_focus; }, },
+			     { '-label' => '< Cancel >',
+			       '-value' => +WIZ_CANCEL,
+			       '-shortcut' => "\x1B",
+			       '-onpress' => sub { 
+				   $cui->delete('add_rr_window');
+				   exit 1; }, },
+			    ],
+	     );
+
+  $win->modalfocus;
+
+  my $button = $buttons->get;
+  $hostname = $nameeditor->get;
+  $ttl = $ttleditor->get;
+  $cname = $cnameeditor->get;
+  $cui->delete('add_rr_window');
+
+  return $button if $button == +WIZ_PREV;
+
+  # User said to continue.  Check quality of input
+  if (! ($hostname =~ /^(?:[a-z0-9][a-z0-9-]*\.?)+$REdomain$/oi)) {
+    $cui->dialog("'$hostname' is not a legal hostname.
+
+Please enter a legal hostname of the form
+foo.$default_domain or foo.bar.$default_domain.
+
+Legal characters are 'a-z', 'A-Z', '0-9'
+and '-'.  '.' may only be used to separate
+characters/numbers in a name.
+
+Press OK to go back to the input form.");
+    goto input_cname;
+  }
+
+  if (! ($cname =~ /^(?:[a-z0-9][a-z0-9-]*\.)+/oi)) {
+    $cui->dialog("'$cname' is not a legal hostname.
+
+Please enter a legal hostname of the form foo.bar.
+
+Legal characters are 'a-z', 'A-Z', '0-9' and '-'.
+'.' may only be used to separate characters/
+numbers in a name.
+
+Press OK to go back to the input form.
+");
+    goto input_cname;
+  }
+
+  my $namecheck = $checkres->query($hostname,'ANY');
+
+  if ($namecheck) {
+      my $msg = "There is already information for $hostname in DNS:
+
+";
+      foreach my $rr ($namecheck->answer) {
+	  $msg .= " ".dnsrrstr($rr)."\n";
+      }
+
+      $msg .="
+You may not combine CNAME with other information.  Please
+remove the other information first or correct the hostname.
+
+Press OK to go back to the input form.";
+      $cui->dialog($msg);
+      goto input_cname;
+  }
+
+  my $cnamecheck = $checkres->query($cname,'A');
+
+  if ($cnamecheck) {
+      # We know that there was a A record available.  But was it found
+      # by resolving a CNAME?
+      if (grep { $_->type eq 'CNAME' } $cnamecheck->answer) {
+	  $cui->dialog("'$cname' is defined as a CNAME.
+
+Chains of CNAMEs is not reliable and should not be used.");
+	  goto input_cname;
+      }
+  } else {
+      $cui->dialog("'$cname' does not appear to be in DNS
+
+Please make it refer to a name that's already in DNS.
+
+Press OK to go back to the input form.");
+      goto input_cname;
+  }
+
+  my ($CNAMEresult) =
+    update_dns($res,$hostname,"add",
+	       update => rr_add("$hostname $ttl CNAME $cname"));
+
+  if ($CNAMEresult) {
+    my ($msg) = "Successfully added
+
+  $hostname $ttl CNAME $cname
+
+to DNS.
+
+Press OK to continue.";
+
+    $cui->dialog($msg);
+
+    exit 0;
+
+  }
+
+  # Nothing to undo and the update_dns procedure gave the error message.
+  exit 1;
+}
+
+
+sub add_record_outside_a {
+  my ($argv)=shift;
+  my ($res)=shift;		# Net::DNS resolver object
+
+  my $hostname = ".$default_domain";
+  my $REdomain = quotemeta $default_domain;
+  my $ttl = $default_ttl;
+  my $address = '';
+
+ input_outside_hostname:
+  my($win) = $cui->add('add_rr_window','Window',
+		       -border => 1,
+		       -ipad => 1,
+		       -height => 11,
+		       -width => 60,
+		       -centered => 1,
+		       -title => "DNS tool: Name a outside IP");
+
+  $win->add(undef,'Label',
+	    '-x' => 1, '-y' => 0,
+	    '-text' => "Please fill in hostname, TTL and address");
+
+  my $nameeditor =
+    $win->add('dnsname','TextEntry',
+	      '-x' => 1, '-y' => 2, '-width' => 25,
+	      '-reverse' => 1,
+	      '-singleline' => 1,
+	      '-regexp' => '/^[-a-z0-9\.]+$/i',
+	      '-text' => $hostname)->focus;
+
+  my $ttleditor =
+    $win->add('dnsttl','TextEntry',
+	      '-x' => 27, '-y' => 2, '-width' => 7,
+	      '-reverse' => 1,
+	      '-singleline' => 1,
+	      '-regexp' => '/^\d+$/',
+	      '-text' => $ttl);
+
+  $win->add(undef,'Label',
+	    '-x' => 35, '-y' => 2,
+	    '-text' => "IN A");
+
+  my $addreditor =
+    $win->add('dnsaddr','TextEntry',
+	      '-x' => 40, '-y' => 2, '-width' => 16,
+	      '-reverse' => 1,
+	      '-singleline' => 1,
+	      '-regexp' => '/^[\.\d]{0,16}$/',
+	      '-text' => $address);
+
+  my $buttons =
+    $win->add(undef,'Buttonbox',
+	      '-x' => 1, '-y' => 6,
+	      '-selected' => 1,
+	      '-buttons' => [
+			     { '-label' => '<< Previous ',
+			       '-value' => +WIZ_PREV,
+			       '-shortcut' => 'p',
+			       '-onpress' => sub { $win->loose_focus; }, },
+			     { '-label' => ' Finish >>',
+			       '-shortcut' => 'f',
+			       '-value' => +WIZ_NEXT,
+			       '-onpress' => sub { $win->loose_focus; }, },
+			     { '-label' => '< Cancel >',
+			       '-value' => +WIZ_CANCEL,
+			       '-shortcut' => "\x1B",
+			       '-onpress' => sub { 
+				   $cui->delete('add_rr_window');
+				   exit 1; }, },
+			    ],
+	     );
+
+  $win->modalfocus;
+
+  my $button = $buttons->get;
+  $hostname = $nameeditor->get;
+  $ttl = $ttleditor->get;
+  $address = $addreditor->get;
+  $cui->delete('add_rr_window');
+
+  return $button if $button == +WIZ_PREV;
+
+  # User said to continue.  Check quality of input
+  if (! ($hostname =~ /^(?:[a-z0-9][a-z0-9-]*\.?)+$REdomain$/oi)) {
+    $cui->dialog("'$hostname' is not a legal hostname.
+
+Please enter a legal hostname of the form
+foo.$default_domain or foo.bar.$default_domain.
+
+Legal characters are 'a-z', 'A-Z', '0-9'
+and '-'.  '.' may only be used to separate
+characters/numbers in a name.
+
+Press OK to return to the input form.
+");
+    goto input_outside_hostname;
+  }
+
+  my @a = ($address =~ m/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+
+  foreach my $i (0..3) {
+      if (defined $a[$i] and $a[$i]>=0 and $a[$i]<=255) {
+	  # All is well
+      } else {
+	  $cui->dialog("'$address' is not a valid IP address.
+
+The address must consist of 4 numbers between 0 and 255
+(inclusive) separated by a total of 3 periods ('.').
+
+Press OK to return to the input form.");
+      goto input_outside_hostname;
+      }
+  }
+
+  my ($Aresult) =
+    update_dns($res,$hostname,,"add",
+	       pre => nxrrset("$hostname A"),
+	       update => rr_add("$hostname $ttl A $address"));
+
+  if ($Aresult) {
+    $cui->dialog("Successfully added
+
+  $hostname $ttl A $address
+
+to DNS.
+
+Press OK to continue.");
+    exit 0;
+
+  }
+
+  # Nothing to undo.  Error messages were given by update_dns.
+
+  exit 1;
+}
+
+sub add_record {
+  my ($argv)=shift;
+  my ($res)=shift;		# Net::DNS resolver object
+  my ($network)=shift;		# Subnet to add to (text) or +ADD_CNAME,
+                                # or +ADD_OUTSIDE
+
+  # None of these add_record procedures should return here unless the
+  # user wanted to go back.
+  if ($network eq +ADD_CNAME) {
+      return (add_record_cname($argv,$res,shift));
+  } elsif ($network eq +ADD_OUTSIDE) {
+      return (add_record_outside_a($argv,$res));
+  } else {
+      return (add_record_inside_a($argv,$res,$network,shift));
+  }
+}
+
+# ########################################################################
+# ###                       Delete records                             ###
+##########################################################################
+
+sub del_records {
+    # This is quite simple as we are passed a textual description of
+    # the records to delete.  They are not in the same zone by
+    # necessity (some subnets are B sized and consists of N C sized
+    # zones).
+    my ($argv) = shift;
+    my ($res) = shift;
+    my ($records) = shift; # Actually a list
+    my $dom;
+    my $rest;
+    my $result;
+    my @failed = ();
+    my @done = ();
+    my $r;
+
+    foreach $r (@{$records}) {
+	# Remove leading space, it confuses split (sort of)
+	$r =~ s/^\s+//;
+	# Pick out the name, ignore the TTL and then keep the rest
+	($dom,undef,$rest) = split(/\s+/,$r,3);
+	$rest =~ s/\s+/ /g;
+	$result =
+	  update_dns($res,$dom,"delete",
+		     update => rr_del("$dom $rest"));
+	push(@failed,"$dom $rest") if !$result;
+	push(@done,"$dom $rest");
+    }
+    if ($#failed >= $[) {
+	my $msg = "These deletions failed:\n\n";
+	map { $msg .= "  update delete $_\n"; } @failed;
+	$msg .= "\nPress OK to end this operation.";
+	$cui->dialog($msg);
+	exit 1;
+    }
+    my ($msg) = "All records deleted successfully:\n\n  ";
+
+    $msg .= join("\n  ",@done);
+
+    $msg .= "\n\nPress OK to continue.";
+
+    $cui->dialog($msg);
+
+    exit 0;
+}
+
+# ########################## Wizard driver ###############################
+
+sub drive_wizard {
+  my ($current) = shift;	# Current step in wizard
+  my ($wizard) = shift;		# List of sub references making up the wizard
+
+  my ($min) = $[;		# The limits of my magic down
+  my ($max) = $#{$wizard};	# and up
+
+  do {
+    &{$wizard->[$current]};
+    # The caller should never handle +WIZ_CANCEL
+    if ($progress == +WIZ_CANCEL) {
+      printwarn "Wizard canceled by user\n";
+      exit 1;
+    }
+    $current += $progress;
+  } while ($current >= $min and $current <= $max);
+
+  # User moved outside the wizard we have, tell caller where the user
+  # wanted to go. (WIZ_PREV: Start over, WIZ_NEXT, continue)
+  return $progress;
+}
+
+
+sub add_wizard ($$) {
+  my ($argv)=shift;
+  my ($tool_server)=shift;
+  my $network; # Network to add to, or +ADD_CNAME or +ADD_OUTSIDE
+  my @values;
+  my $name;    # DNS name to add
+  my $value;   # The value of the name to add
+  local($progress); # Dynamic scope: Share with wizard driver
+  my @wizlist;
+
+  my $server = Net::DNS::Resolver->new(nameservers => [ $tool_server ],
+				    recurse => 0,
+				    debug => 0);
+
+  load_policy($server);
+
+  @wizlist =
+    (sub { ($progress,$network) = &network_list($argv,$server); },
+     sub { ($progress,@values) = # @values = a list of one address to add
+	     &subnet_list_add($argv,$server,$network,$progress); },
+     sub { ($progress) =
+	     &add_record($argv,$server,$network,\@values); } );
+
+  $progress = drive_wizard( scalar($[) ,\@wizlist);
+
+  # The user wants to go to before the wizard started, ... so drop out
+  exit 0 if $progress == +WIZ_PREV;
+
+  # The wizard step implementors should terminate on their own when
+  # done
+  exit 1;
+}
+
+
+sub del_wizard {
+  my ($argv)=shift;
+  my ($tool_server)=shift;
+  local($progress); # Dynamic scope: Share with wizard driver
+  my @wizlist;
+  my $network;
+  my $records;
+
+  my $server = Net::DNS::Resolver->new(nameservers => [ $tool_server ],
+				       recurse => 1,
+				       debug => 0);
+
+  load_policy($server);
+
+  @wizlist =
+    (sub { ($progress,$network) = &network_list($argv,$server); },
+     sub { ($progress,$records) = &list_del($argv,$server,$network); },
+     sub { ($progress) = &del_records($argv,$server,$records); } );
+
+  $progress = drive_wizard( scalar($[), \@wizlist);
+
+  # The user wants to go to before the wizard started, ... so drop out
+  exit 0 if $progress == +WIZ_PREV;
+
+  # The wizard step implementors should terminate on their own when done
+  exit 0;
+}

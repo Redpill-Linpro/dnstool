@@ -1,0 +1,34 @@
+; -*- zone -*- <- for emacs
+$TTL 300
+@ SOA dnstooltest.example.example. hostmaster.example.example. 1 3H 15M 4W 300
+
+                NS      dnstooltest.example.example.
+                NS      dnstooltest2.example.example.
+
+; What's the router address policy? 1 equals first address, where zeroth address is the network address.
+router          TXT     "1"
+;
+; Default TTL for new records
+;
+ttl             TXT     "300"
+;
+; Default DNS domain
+;
+dnsdomain       TXT     "example.example."
+;
+; Where generated zone files are kept
+;
+zonedir         TXT     "/var/lib/bind/dnstool-rev"
+;
+; What the template empty zone file is called
+;
+zonetempl       TXT     "/etc/bind/dnstool/empty-zone"
+;
+; What the generated config is called
+;
+zoneconfig      TXT     "/var/lib/bind/dnstool-rev/zones.conf"
+;
+; dnstool master server (send updates there)
+;
+toolmaster      TXT     "dnstooltest.example.example"
+

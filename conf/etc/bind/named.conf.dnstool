@@ -1,0 +1,14 @@
+zone "policy.dnstool" {
+        type master;
+        file "/etc/bind/dnstool/policy";
+        allow-update { none; };
+};
+
+zone "networks.dnstool" {
+        type master;
+        file "/var/lib/bind/dnstool/networks";
+        allow-update { localhost; };
+};
+
+include "/var/lib/bind/dnstool-rev/zones.conf";
+

@@ -1,0 +1,434 @@
+#!/usr/bin/perl -w
+# -*- cperl -*-
+#
+# dnstool-zonesync: Tool to update DNS based on metadata in a zone.
+#
+#    Copyright 2006,2010 Nicolai Langfeldt, Linpro AS
+#    Copyright 2012 Erik Inge Bolsø, Redpill Linpro AS
+#    Copyright 2006,2010,2012 Oslo Lufthavn AS
+#
+#    This file is part of dnstool.
+#
+#    dnstool is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    dnstool is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with dnstool.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+
+use Net::DNS;
+use Net::DNS::Update;
+use NetAddr::IP;
+use Data::Dumper;
+use Carp;
+
+my $debug = 0;
+
+my %nwdesc;	  # Hash of subnet descriptions
+my %router;	  # Routers indexed by prefix/mask
+
+# Some setup to allow us to see messages ...  does not appear to work
+# too well :-(
+
+sub printwarn {
+    print join('',@_);
+    if (open(LOGFIL,">>".$ENV{'HOME'}."/dnstool.log")) {
+	print LOGFIL join('',@_);
+	close(LOGFIL);
+    } else {
+	print "Error opening logfile: $!";
+    }
+}
+
+sub printnolog {
+    print join('',@_);
+}
+
+
+sub printlog {
+    if (open(LOGFIL,">>".$ENV{'HOME'}."/dnstool.log")) {
+	print LOGFIL join('',@_);
+	close(LOGFIL);
+    } else {
+	printwarn "Error opening logfile: $!\n";
+    }
+}
+
+
+sub printmsg {
+    print join('',@_);
+    if (open(LOGFIL,">>".$ENV{'HOME'}."/dnstool.log")) {
+	print LOGFIL join('',@_);
+	close(LOGFIL);
+    } else {
+	print "Error opening logfile: $!";
+    }
+}
+
+
+# ####################################################################
+# ###                         MAIN HERE                            ###
+# ####################################################################
+
+my $tool_server = &find_toolserver(\@ARGV);
+
+my $res = Net::DNS::Resolver->new(nameservers => [ $tool_server ],
+				  recurse => 0);
+
+my ($zonedir, $zonetempl, $zoneconfig) = get_config($res);
+
+printlog("dnstool-zonesync started at ".scalar(localtime())."\n");
+
+network_generator($res);
+
+exit 0;
+
+# ####################################################################
+# ###                      HELP PROCEDURES                         ###
+# ####################################################################
+
+sub find_toolserver {
+    # Find the nameserver authoritative for the dnstool zones,
+    # could be that the user said the name on the commandline.
+    my($argv)=shift;
+
+    # PRODUCTION USE:
+    if (defined(${$argv}[0])) {
+	if ( (${$argv}[0] eq 'srv' or
+	      ${$argv}[0] eq 'server' or
+	      ${$argv}[0] eq 'ser') ) {
+	    shift(@{$argv});
+	    if (defined(${$argv}[0])) {
+		return shift(@{$argv});
+	    } else {
+		die "server argument not followed by name server name!\n";
+	    }
+	}
+    }
+
+    my $firstres = Net::DNS::Resolver->new(recurse => 1,
+					   debug => 0);
+
+    die if !defined $firstres;
+
+    # Get tool-server name
+    my $toolserver = get_txt($firstres,'toolmaster.policy.dnstool');
+
+    die "Could not find dnstool server!\n" unless defined($toolserver);
+
+    return $toolserver;
+};
+
+
+# ######################## Load policies/defaults ######################
+
+sub search_A {
+  # Get A record with the given name via the given resolver
+
+  my ($res) = shift;
+  my ($name) = shift;
+
+  my ($query) = $res->search($name,'A');
+
+  unless ($query) {
+    printwarn ("Couldn't look up \"$name\" A record\n");
+    return undef;
+  }
+
+  foreach my $rr ($query->answer) {
+    next unless $rr->type eq 'A';
+
+    return $rr->address;
+  }
+  return undef;
+}
+
+
+sub get_txt {
+  # Get TXT record with the given name via the given resolver
+
+  my ($res) = shift;
+  my ($name) = shift;
+
+  my ($query) = $res->query($name,'TXT');
+
+  die "Could not find $name TXT" unless defined $query;
+
+  foreach my $rr ($query->answer) {
+    next unless $rr->type eq 'TXT';
+
+    return $rr->txtdata;
+  }
+  return undef;
+}
+
+
+# This generates a reverse DNS address from a IP number.  Or the opposite.
+
+sub revdns {
+  my $ip = shift;
+
+  if ($ip =~ s/\.in-addr\.arpa\.?$//) {
+    return join('.',reverse split('\.',$ip));
+  } else {
+    return join('.',reverse(split('\.',$ip)),'in-addr.arpa.');
+  }
+}
+
+# This sorts by IP-address in case something generates them in the wrong
+# order.  A DNS zone transfer is most often not ordered by IP for example
+
+sub bynetwork {
+  my($ann) = $a->name;
+  my($bnn) = $b->name;
+
+  croak "Undefined networks" if !defined($ann) or !defined($bnn);
+
+  $ann = NetAddr::IP->new($ann);
+  $bnn = NetAddr::IP->new($bnn);
+
+  croak "Undefined objects" if !defined($ann) or !defined($bnn);
+
+  my($cmp) = $ann <=> $bnn;
+
+  if ($debug) {
+    my($c) = '==';
+
+    $c = '<' if ($cmp == -1);
+    $c = '>' if ($cmp == 1);
+
+    printwarn("Compared and found: $ann $c $bnn\n");
+  }
+
+  return $cmp;
+
+  # This is the short version, not to easy to debug.
+  # return NetAddr::IP->new($ann) <=> NetAddr::IP->new($bnn);
+}
+
+
+sub byinaddr {
+    # Sort list of labels that looks like this:
+    #     "   5.2.0.192.in-addr.arpa. 3600 IN PTR dnstooltest.example.example."
+    my ($aw)=$a; # Work copy of $a
+    my ($bw)=$b; # Work copy of $b
+
+    # REmove leading space
+    $aw =~ s/^\s+//;
+    $bw =~ s/^\s+//;
+    ($aw) = split(/\s+/,$aw,2);
+    ($bw) = split(/\s+/,$bw,2);
+
+    # Make a regular IP of it.
+    $aw = revdns($aw);
+    $bw = revdns($bw);
+
+    # Convert to IP objects and compare
+    my($cmp) = NetAddr::IP->new($aw) <=> NetAddr::IP->new($bw);
+
+    return $cmp;
+}
+
+
+sub dnsrrstr {
+    my $rr = shift;
+    my $data = '';
+
+    if (defined($data=$rr->rdatastr) || $data) {
+	# OK fine
+    } else {
+	$data="; no data available";
+    }
+
+    return sprintf("%25s %6d %2s %-5s %s",$rr->{'name'},$rr->{'ttl'},
+		   $rr->{'class'},$rr->{'type'},$data);
+
+}
+
+# ######################### NETWORK SELECTOR ###########################
+
+sub network_generator {
+    # Generate a list of networks defined in the networsk.dnstool zone
+    # The list is normalized to /24 networks so reverse configurations
+    # can easily be made.
+
+    my ($res)=shift;
+
+    # List of networks one can add addresses to
+    my (@zone) = $res->axfr('networks.dnstool');
+
+    if (!@zone) {
+	printwarn("DNS problem:\nUnable to retrieve networks.dnstool:\n".
+		  $res->errorstring."\n");
+	exit 1;
+    }
+
+    my $rr;		  # Resource iterator
+    my $nn;		  # Resource "name" (actually 'label or name')
+    my @zones = ();	  # Reverse zones obtained.
+
+    foreach $rr (@zone) {
+	next unless $rr->type eq 'TXT';
+
+	$nn = $rr->name;
+	$nn =~ s/\.networks.dnstool$//i;
+
+	push(@zones , reverse_zone_network($nn, $res));
+
+    }
+    setup_zones(\@zones);
+}
+
+
+sub reverse_zone_network {
+    # Now we know what networks are defined in the zone
+
+    my ($network, $res) = @_;
+
+    # $1: Network to set up, such as: '10.176.1.0/27' or 10.176.1.0/24
+    # $2: DNS Resolver handle
+
+    my $i=0;	       # Value iterator for building label hash.
+    my $ip;	       # Network-address iterator (NetAddr::IP object)
+    my $ips;	       # Network-address stringifyed
+    my $rr;	       # DNS query iterator
+    my $net = new NetAddr::IP $network; # Network we're setting up
+    my $onet = $net;
+    my @nets=(); # Networks to iterate over (if more than 8 bits of subnet)
+    my %reverse=(); # Reverse lookup hash gathered in-addr.arpa AXFRs.
+    my $ptr;	    # A string containg some reverse lookup info
+
+    # We're faced with one of thre cases:
+    # 1. The selected network is C-net sized (/24)
+    # 2. The selected network is smaller (/25, /26, ...)
+    # 3. The selected network is larger (/23, /22, ...)
+    #
+    # Case 1 and 2 will be handled the same way
+
+    my $netw = $net->masklen;
+
+    my $forw = $net->cidr;
+
+    # print "**** Network is ".$net->cidr."\n";
+    # print "* The network mask is $netw\n";
+
+    if ($netw > 24) {
+	# print "A reversezone is larger than network: $netw\n";
+	my $revnet = new NetAddr::IP( $net->addr.'/24' )->network;
+	# print "Reverse network is ".$revnet->cidr."\n";
+	@nets = ( $revnet );
+    } elsif ( $netw == 24) {
+	# print "Network is 24 bits wide\n";
+	@nets = ($net);
+    } else {
+	# print "Splitting subnet into smaller reverse nets\n";
+	# Split the large subnet into reverse-zone sized networks
+	@nets = $net->split(24);
+	# print "Got ". scalar(@nets) ." subnets\n"; #
+    }
+    return @nets;
+}
+
+
+sub get_config {
+  my ($res) = @_;
+
+  my $zonedir    = get_txt($res,'zonedir.policy.dnstool.') or
+    die "Could not retrieve configuration item zonedir.policy.dnstool\n";
+  my $zonetempl  = get_txt($res,'zonetempl.policy.dnstool.') or
+    die "Could not retrieve configuration item zonetempl.policy.dnstool\n";
+  my $zoneconfig = get_txt($res,'zoneconfig.policy.dnstool.') or
+    die "Could not retrieve configuration item zoneconfig.policy.dnstool\n";
+
+  die "zonedir $zonedir is not a (existing)  directory\n" if ! -d $zonedir;
+  die "zone template $zonetempl is not a (existing) file\n" if ! -f $zonetempl;
+
+  return ($zonedir,$zonetempl,$zoneconfig);
+}
+
+
+sub setup_zones {
+    my ($zones) = @_;
+    my %revnets = (); # Reverse nets we've set up until now.
+
+    open (CONFIG,">$zoneconfig.new") or
+      die "Could not open $zoneconfig.new for writing: $!\n";
+
+    foreach my $net (@$zones) {
+	next if defined($revnets{$net});
+
+	# print "Network ".$net->cidr."\n";
+
+	# The network we're making a reverse zone for is /24 so
+	# we call the zonefile x.x.x (from the three first octets)
+
+	my $zonefile = $net->addr;
+	$zonefile =~ s~\.\d+$~~;
+
+	my $zonename = revdns($zonefile);
+
+	# Duplicate zone file due to super/subnet overlaps
+	next if defined($revnets{$zonefile});
+
+	$revnets{$zonefile} = 1;
+
+	print CONFIG <<EOM
+zone "$zonename" {
+    type master;
+    file "/var/lib/bind/dnstool-rev/$zonefile";
+    allow-update { localhost; };
+};
+
+EOM
+        or die "Could not write to $zoneconfig.new: $!.  Aborting.\n";
+
+	# print "Zone file name is $zonefile, zone name is $zonename\n";
+
+	next if -f "$zonedir/$zonefile";
+
+	print "Making new zone $zonename\n";
+	if (system("cp -i $zonetempl $zonedir/$zonefile") != 0) {
+	    die "Failed to copy $zonetempl to $zonedir/$zonefile.\n";
+	}
+
+    }
+    close(CONFIG) or die "Could not close $zoneconfig.new: $!.  Aborting.\n";
+
+    rename "$zoneconfig.new", $zoneconfig or
+      die "Could not rename $zoneconfig.new to $zoneconfig: $!\n";
+
+    if (system("rndc reconfig") != 0) {
+	die "Failed to run 'rndc reconfig'.\nName server is probably not correctly configured\n";
+    }
+
+    my @orphans = ();
+
+    # Now check what zones are orphaned
+    opendir(my $dir,$zonedir) or
+      die "Could not open directory $zonedir for listing: $!\n";
+
+    while (my $file = readdir($dir) ) {
+	# print "Orphan?: $file\n";
+	next unless $file =~ m/^[1-9]/;
+	next if $file =~ m/\.jnl$/;
+	next if defined($revnets{$file});
+
+	push(@orphans, $file);
+    }
+
+    if (scalar(@orphans)) {
+	print "Orphan zones in $zonedir: ",join(" ", sort(@orphans) ),"\n";
+    } else {
+	print "There are no orphan zones\n";
+    }
+
+    print "New zone configuration written and nameserver reconfigured\n";
+}

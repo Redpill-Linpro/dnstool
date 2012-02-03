@@ -1,0 +1,15 @@
+$ORIGIN .
+$TTL 86400	; 1 day
+2.0.192.in-addr.arpa	IN SOA	dnstooltest.example.example. hostmaster.example.example. (
+				3          ; serial
+				10800      ; refresh (3 hours)
+				900        ; retry (15 minutes)
+				2419200    ; expire (4 weeks)
+				86400      ; minimum (1 day)
+				)
+			NS	dnstooltest.example.example.
+			NS	dnstooltest2.example.example.
+$ORIGIN 2.0.192.in-addr.arpa.
+$TTL 300	; 5 minutes
+5			PTR	dnstooltest.example.example.
+6			PTR	dnstooltest2.example.example.

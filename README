@@ -1,0 +1,191 @@
+DNSTOOL README
+
+PURPOSE
+
+Dnstool is a set of curses-based user interfaces and supporting scripts
+for easy administration of a large dns zone with dozens of reverse zones.
+
+LICENSE
+
+Dnstool is distributed under the terms of the GNU General Public License
+(GPL) version 3 or later (at your option), which can be found in the file
+named COPYING.
+
+INSTALLING
+
+Prerequisites:
+
+Debian/Ubuntu "DNS Server" base install
+
+# apt-get install libnetaddr-ip-perl libnet-dns-perl libcurses-perl libcurses-ui-perl
+
+Assumes a Debian-style BIND version 9 install; should be adaptable to other
+layouts, previous incarnations have been known to run fine on RHEL.
+
+Configuration is saved in DNS, in the "policy.dnstool" and "networks.dnstool"
+local zones.
+
+For an example setup using RFC 5737 networks, do a "make install", then add
+ include "/etc/bind/named.conf.dnstool";
+ include "/etc/bind/named.conf.example";
+to /etc/bind/named.conf
+
+The toolmaster configured in "policy.dnstool" needs to be correct in the local
+DNS, or nothing will work. An otherwise-working /etc/hosts override is not enough.
+
+Config layout: (/var files are updated by scripts or named, /etc is left to the sysadmin)
+
+├── etc
+│   └── bind
+│       ├── dnstool
+│       │   ├── empty-zone
+│       │   └── policy
+│       ├── named.conf.dnstool
+│       └── named.conf.example
+└── var
+    └── lib
+        └── bind
+            ├── dnstool
+            │   ├── example.example
+            │   └── networks
+            └── dnstool-rev
+                ├── 192.0.2
+                ├── 198.51.100
+                ├── 201.0.113
+                └── zones.conf
+
+RUNNING
+
+The individual tools should be pretty self-explanatory.
+Meant to be run on a DNS master, as the BIND user.
+
+dnstool edits forward and reverse zones.
+dnstool-admin edits the list of administered reverse zones.
+
+In case of trouble, the tools log to $HOME/dnstool.log
+respective $HOME/dnstool-admin.log.
+
+dnstool-zonesync is a helper script that creates the actual reverse zones and reloads bind config.
+
+extras/ has various other scripts useful for automation and documentation.
+
+SCREENSHOTS
+
+Well, why not?
+
+               ┌ DNS tool: Choose an operation ─────────────────┐
+               │                                                │
+               │                                                │
+               │  Add or remove DNS record?                     │
+               │                                                │
+               │                                                │
+               │  < Add > < Delete > < Exit >                   │
+               │                                                │
+               │                                                │
+               │  DNS-tool server: dnstooltest.example.exam$    │
+               │                                                │
+               │                                                │
+               └────────────────────────────────────────────────┘
+┌ DNS tool: Add an address ────────────────────────────────────────────────────┐
+│                                                                              │
+│  Choose a network                                                            │
+│                                                                              │
+│ ┌              Prefix  Description ────────────────────────────────────────┐ │
+│ │Add address based alias (an A record)                                     │ │
+│ │Add name based alias (a CNAME record)                                     │ │
+│ │        192.0.2.0/24  TEST-NET-1                                          │ │
+│ │     198.51.100.0/24  TEST-NET-2                                          │ │
+│ │      201.0.113.0/24  TEST-NET-3                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ └──────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│ Filter:                                   << Previous   Next >> < Cancel >   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌ DNS tool: Add ───────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  Choose an IP-address from 192.0.2.0/24 TEST-NET-1                           │
+│                                                                              │
+│ ┌        Address  Description ─────────────────────────────────────────────┐ │
+│ │      192.0.2.1  not used                                                   │
+│ │      192.0.2.2  not used                                                 │ │
+│ │      192.0.2.3  not used                                                 │ │
+│ │      192.0.2.4  not used                                                 │ │
+│ │      192.0.2.7  not used                                                 │ │
+│ │      192.0.2.8  not used                                                 │ │
+│ │      192.0.2.9  not used                                                 │ │
+│ │     192.0.2.10  not used                                                 │ │
+│ │     192.0.2.11  not used                                                 │ │
+│ │     192.0.2.12  not used                                                 │ │
+│ │     192.0.2.13  not used                                                 │ │
+│ │     192.0.2.14  not used                                                 │ │
+│ │     192.0.2.15  not used                                                 │ │
+│ │     192.0.2.16  not used                                                 │ │
+│ │     192.0.2.17  not used                                                 │ │
+│ └──────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│ Filter:   not used                        << Previous   Next >> < Cancel >   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+          ┌ DNS tool: Input name ────────────────────────────────────┐
+          │                                                          │
+          │  Please fill in hostname and TTL                         │
+          │                                                          │
+          │  .example.example.         300     IN A 192.0.2.11       │
+          │                                                          │
+          │  << Previous   Finish >> < Cancel >                      │
+          │                                                          │
+          │  [X] Create A record                                     │
+          │                                                          │
+          │  [X] Create PTR record                                   │
+          │                                                          │
+          └──────────────────────────────────────────────────────────┘
+       ┌───────────────────────────────────────────────────────────────┐
+       │                                                               │
+       │ ┌───────────────────────────────────────────────────────────┐ │
+       │ │Successfully added                                         │ │
+       │ │                                                           │ │
+       │ │  test1.example.example. 300 A 192.0.2.11                  │ │
+       │ │                                                           │ │
+       │ │and                                                        │ │
+       │ │                                                           │ │
+       │ │  11.2.0.192.in-addr.arpa. 300 PTR test1.example.example.  │ │
+       │ │                                                           │ │
+       │ │to DNS. The default router on that network                 │ │
+       │ │is 192.0.2.1.                                              │ │
+       │ │                                                           │ │
+       │ │Press OK to end this operation.                            │ │
+       │ └───────────────────────────────────────────────────────────┘ │
+       │                                                               │
+       │                                                        < OK > │
+       │                                                               │
+       └───────────────────────────────────────────────────────────────┘
+
+
+AUTHOR
+
+Originally commissioned work for Oslo Lufthavn AS (osl.no), open-sourced in 2012.
+
+Copyright 2006,2010 Nicolai Langfeldt, Linpro AS
+Copyright 2012 Erik Inge Bolsø, Redpill Linpro AS
+Copyright 2006,2010,2012 Oslo Lufthavn AS
+
+MAILING LIST
+
+For questions, patches and discussion of dnstool, there is a
+moderated-for-nonmembers mailing list set up at dnstool@projects.linpro.no.
+
+Subscribe/unsubscribe: http://projects.linpro.no/mailman/listinfo/dnstool
+Public archives: http://projects.linpro.no/pipermail/dnstool/
+

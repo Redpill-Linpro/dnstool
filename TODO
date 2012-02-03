@@ -1,0 +1,9 @@
+POST-RELEASE:
+- add autozones scripts
+
+FUTURE:
+- IPv6 (AAAA, .ip6.arpa)
+- TXT records (SPF, DKIM, etc)
+- MX records
+- SRV records (for SIP, etc)
+

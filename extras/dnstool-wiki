@@ -1,0 +1,612 @@
+#!/usr/bin/perl -w
+# -*- cperl -*-
+#
+# dnstool-wiki: Tool to dump dnstool-managed reverse zones to mediawiki for reference
+#
+#    Copyright 2006,2010 Nicolai Langfeldt, Linpro AS
+#    Copyright 2012 Erik Inge Bolsø, Redpill Linpro AS
+#    Copyright 2006,2010,2012 Oslo Lufthavn AS
+#
+#    This file is part of dnstool.
+#
+#    dnstool is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    dnstool is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with dnstool.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+
+use Net::DNS;
+use Net::DNS::Update;
+use NetAddr::IP;
+use Data::Dumper;
+use MediaWiki::API;
+use Carp;
+
+my $debug = 0;
+
+my %name;	  # Hash of network names (down to /24 inclusive)
+my %smallname;    # and for the small networks (/25 and down inclusive)
+my %contains;     # Nested hash of networks contained by some other network.
+my %contained;
+my @wikipage = ();
+my $limit_pages = -1; # Set to 5 to limit uploads to 5, set to -1 for infinite.
+
+# Some setup to allow us to see messages ...  does not appear to work
+# too well :-(
+
+sub printwarn {
+    print join('',@_);
+    if (open(LOGFIL,">>".$ENV{'HOME'}."/dnstool-wiki.log")) {
+	print LOGFIL join('',@_);
+	close(LOGFIL);
+    } else {
+	print "Error opening logfile: $!";
+    }
+}
+
+sub printnolog {
+    print join('',@_);
+}
+
+
+sub printlog {
+    if (open(LOGFIL,">>".$ENV{'HOME'}."/dnstool-wiki.log")) {
+	print LOGFIL join('',@_);
+	close(LOGFIL);
+    } else {
+	printwarn "Error opening logfile: $!\n";
+    }
+}
+
+
+sub printmsg {
+    print join('',@_);
+    if (open(LOGFIL,">>".$ENV{'HOME'}."/dnstool-wiki.log")) {
+	print LOGFIL join('',@_);
+	close(LOGFIL);
+    } else {
+	print "Error opening logfile: $!";
+    }
+}
+
+
+sub wp {
+    # Wiki push
+
+    push(@wikipage,@_);
+}
+
+
+# ####################################################################
+# ###                         MAIN HERE                            ###
+# ####################################################################
+
+chdir ("/var/cache/dnstool") or
+  die "Could not chdir to /var/cache/dnstool: $!\n";
+
+my $tool_server = &find_toolserver(\@ARGV);
+
+my $res = Net::DNS::Resolver->new(nameservers => [ $tool_server ],
+				  recurse => 0);
+
+my ($wikiapi, $domain, $user, $pw) = get_config($res);
+
+printlog("dnstool-wiki started at ".scalar(localtime())."\n");
+
+# Removes all - for a fresh upload now
+print "Deleting old pages\n";
+wiki_nuke();
+
+print "Examining DNS data\n";
+network_generator($res);
+
+print "Making new pages\n";
+wiki_generator();
+
+exit 0;
+
+# ####################################################################
+# ###                      HELP PROCEDURES                         ###
+# ####################################################################
+
+my $wh;
+
+
+sub wiki_login {
+    if (!defined($wh)) {
+	# print "Wiki login\n";
+	$wh = MediaWiki::API->new( { api_url => $wikiapi } );
+
+	$wh->login( { lgname => $user, lgpassword => $pw } ) or
+	  die "Wiki error: ".$wh->{error}->{code}.': '.$wh->{error}->{details};
+    }
+}
+
+
+sub wiki_delete_pages {
+    my ($ref) = @_;
+
+    foreach (@$ref) {
+	$wh->edit( {
+		    action => 'delete',
+		    title => $_->{title},
+		    reason => 'new version comming up' } )
+	  or die $wh->{error}->{code} . ': ' . $wh->{error}->{details};
+    }
+}
+
+
+sub wiki_nuke {
+    # Nuke dnstool pages on the wiki.
+
+    wiki_login;
+
+    # process the first 400 articles in the main namespace in the
+    # category "Surnames".  get 100 at a time, with a max of 4 and
+    # pass each 100 to our hook.
+
+    $wh->list ( { action => 'query',
+		  list => 'categorymembers',
+		  cmtitle => 'Category:dnstool IP information',
+		  cmlimit=>'100' },
+		{ max => 4, hook => \&wiki_delete_pages } )
+  || die $wh->{error}->{code} . ': ' . $wh->{error}->{details};
+}
+
+
+sub wiki_upload {
+    # Send a wiki page to the wiki.
+    my ($pagetitle, $content) = @_;
+
+    my $page = join('',@{$content})."\n";
+
+    wiki_login;
+
+    my $ref = $wh->get_page( { 'title' => $pagetitle } ) or
+      die $wh->{error}->{code} . ': ' . $wh->{error}->{details};
+
+    die if $ref->{missing};
+
+    my $timestamp = $ref->{timestamp};
+
+    $wh->edit( {
+		  'action' => 'edit',
+		  'title' => $pagetitle,
+		  'basetimestamp' => $timestamp,
+		  'text' => $page,
+		 } )
+      or die $wh->{error}->{code} . ': ' . $wh->{error}->{details};
+}
+
+
+sub wiki_print {
+    my ($pagetitle, $content) = @_;
+
+    print "=================================\n/$pagetitle\n";
+    print @{$content},"\n";
+}
+
+
+sub wiki_shipout {
+    my ($page) = @_;
+
+    print "Sending '$page' to wiki\n" if $limit_pages>0;
+    wiki_upload($page,\@wikipage);
+
+    # wiki_print($page,\@wikipage);
+
+    @wikipage = ();
+
+    $limit_pages--;
+
+    die "limit pages" if $limit_pages == 0;
+
+    print "Pages left $limit_pages\n" if $limit_pages > 0;
+
+}
+
+
+sub find_toolserver {
+    # Find the nameserver authoritative for the dnstool zones,
+    # could be that the user said the name on the commandline.
+    my($argv)=shift;
+
+    # PRODUCTION USE:
+    if (defined(${$argv}[0])) {
+	if ( (${$argv}[0] eq 'srv' or
+	      ${$argv}[0] eq 'server' or
+	      ${$argv}[0] eq 'ser') ) {
+	    shift(@{$argv});
+	    if (defined(${$argv}[0])) {
+		return shift(@{$argv});
+	    } else {
+		die "server argument not followed by name server name!\n";
+	    }
+	}
+    }
+
+    my $firstres = Net::DNS::Resolver->new(recurse => 1,
+					   debug => 0);
+
+    die if !defined $firstres;
+
+    # Get tool-server name
+    my $toolserver = get_txt($firstres,'toolmaster.policy.dnstool');
+
+    die "Could not find dnstool server!\n" unless defined($toolserver);
+
+    return $toolserver;
+};
+
+
+# ######################## Load policies/defaults ######################
+
+sub search_A {
+  # Get A record with the given name via the given resolver
+
+  my ($res) = shift;
+  my ($name) = shift;
+
+  my ($query) = $res->search($name,'A');
+
+  foreach my $rr ($query->answer) {
+    next unless $rr->type eq 'A';
+
+    return $rr->address;
+  }
+  return undef;
+}
+
+
+sub get_txt {
+  # Get TXT record with the given name via the given resolver
+
+  my ($res) = shift;
+  my ($name) = shift;
+
+  my ($query) = $res->query($name,'TXT');
+
+  die "Could not find $name TXT" unless defined $query;
+
+  foreach my $rr ($query->answer) {
+    next unless $rr->type eq 'TXT';
+
+    return $rr->txtdata;
+  }
+  return undef;
+}
+
+
+# This generates a reverse DNS address from a IP number.  Or the opposite.
+
+sub revdns {
+  my $ip = shift;
+
+  # Remove subnet mask
+  $ip =~ s~/(\d+)~~;
+
+  if ($ip =~ s/\.in-addr\.arpa\.?$//) {
+    return join('.',reverse split('\.',$ip));
+  } else {
+    return join('.',reverse(split('\.',$ip)),'in-addr.arpa.');
+  }
+}
+
+sub bynetwork {
+    # This sorts by IP-address in case something generates them in the
+    # wrong order.  A DNS zone transfer is most often not ordered by
+    # IP for example
+
+    croak "Undefined networks" if !defined($a) or !defined($b);
+
+    my $ann = NetAddr::IP->new($a);
+    my $bnn = NetAddr::IP->new($b);
+
+    croak "Undefined objects" if !defined($ann) or !defined($bnn);
+
+    my($cmp) = $ann <=> $bnn;
+
+    if ($debug) {
+	my($c) = '==';
+
+	$c = '<' if ($cmp == -1);
+	$c = '>' if ($cmp == 1);
+
+	printwarn("Compared and found: $ann $c $bnn\n");
+    }
+
+    return $cmp;
+
+    # This is the short version, not to easy to debug:
+    # return NetAddr::IP->new($ann) <=> NetAddr::IP->new($bnn);
+}
+
+
+sub byinaddr {
+    # Sort list of labels that looks like this:
+    #     "   5.2.0.192.in-addr.arpa. 3600 IN PTR dnstooltest.example.example."
+    my ($aw)=$a; # Work copy of $a
+    my ($bw)=$b; # Work copy of $b
+
+    # REmove leading space
+    $aw =~ s/^\s+//;
+    $bw =~ s/^\s+//;
+    ($aw) = split(/\s+/,$aw,2);
+    ($bw) = split(/\s+/,$bw,2);
+
+    # Make a regular IP of it.
+    $aw = revdns($aw);
+    $bw = revdns($bw);
+
+    # Convert to IP objects and compare
+    my($cmp) = NetAddr::IP->new($aw) <=> NetAddr::IP->new($bw);
+
+    return $cmp;
+}
+
+
+sub dnsrrstr {
+    my $rr = shift;
+    my $data = '';
+
+    if (defined($data=$rr->rdatastr) || $data) {
+	# OK fine
+    } else {
+	$data="; no data available";
+    }
+
+    return sprintf("%25s %6d %2s %-5s %s",$rr->{'name'},$rr->{'ttl'},
+		   $rr->{'class'},$rr->{'type'},$data);
+
+}
+
+# ######################### NETWORK SELECTOR ###########################
+
+sub network_generator {
+    # Generate a list of networks defined in the networsk.dnstool zone
+    # The list is normalized to /24 networks so reverse configurations
+    # can easily be made.
+
+    my ($res)=shift;
+
+    # List of networks one can add addresses to
+    my (@zone) = $res->axfr('networks.dnstool');
+
+    if (!@zone) {
+	printwarn("DNS problem:\nUnable to retrive networks.dnstool:\n".
+		  $res->errorstring."\n");
+	exit 1;
+    }
+
+    my $rr;		  # Resource iterator
+    my $nn;		  # Resource "name" (actually 'label or name')
+    my @zones = ();	  # Reverse zones obtained.
+    my %zones = ();
+
+    foreach $rr (@zone) {
+	next unless $rr->type eq 'TXT';
+
+	$nn = $rr->name;
+	$nn =~ s/\.networks.dnstool$//i;
+
+	remember_network($nn, $rr->txtdata, $res);
+    }
+}
+
+
+sub remember_network {
+    # Figure out what the /24 network(s) for the given network is.
+    # /24 because that is the size of the reverse zones made by
+    # dnstool.
+
+    my ($network, $nwname, $res) = @_;
+
+    # $network: Network to set up, such as: '10.176.1.0/27' or 10.176.1.0/24
+    # $nwname: Name of the network as given in the "networks.dnstool" zone
+    # $res: DNS Resolver handle
+
+    my $net = new NetAddr::IP $network; # Network we're setting up
+
+    # We're faced with one of three cases:
+    # 1. The selected network is C-net sized (/24)
+    # 2. The selected network is smaller (/25, /26, ...)
+    # 3. The selected network is larger (/23, /22, ...)
+    #
+    # Case 1 and 2 will be handled the same way
+
+    my $netw = $net->masklen;
+    my $cidr = $net->network;
+
+    if ($netw > 24) {
+
+	my $bignet = (new NetAddr::IP( $net->addr.'/24' ))->network;
+
+	# print "Small network: $cidr under $bignet\n";
+	# Bignet is larger, and contains the network
+
+	$name{$bignet}     ||= "";
+
+	if ($name{$bignet} =~ m/Supernet of/) {
+	    $name{$bignet} .= ", $nwname";
+	} else {
+	    $name{$bignet} .= "Supernet of $nwname";
+	}
+
+	$contains{$bignet}          ||= {};
+	$contains{$bignet}->{$cidr}   = 1;
+
+	$smallname{$cidr}  = $nwname;
+
+    } elsif ( $netw == 24) {
+	$name{$network} = $nwname;
+    } else {
+	$name{$network} = $nwname;
+
+	# Splitting net into smaller nets
+
+	$contains{$network} ||= {};
+
+	foreach my $smallnet ($net->split(24)) {
+	    $cidr = $smallnet->network;
+	    $contains{$network}->{$cidr}=1;
+	}
+    }
+}
+
+
+sub do_axfr {
+    # $net is a subnet on the format x.x.x.x/24.
+    my ($net) = @_;
+
+    my $rnet = revdns($net);
+    my $data=0;
+
+    # Remove fourth octet.
+    $rnet =~ s~\d+\.~~;
+
+    my @query = $res->axfr($rnet);
+
+    wp "DNS data for $net";
+
+    if (defined($name{$net})) {
+	wp ": ",$name{$net};
+    }
+    wp ":\n";
+
+    my %list;
+    my $ip;
+
+    # First pass to generate IP numbers to enable sorting by IP
+    foreach my $rr (@query) {
+	next if $rr->{'type'} eq 'SOA' or $rr->{'type'} eq 'NS';
+	$data++;
+
+	$ip = revdns($rr->{'name'});
+
+	$list{$ip} = dnsrrstr($rr)." ($ip)";
+    }
+
+    if ($data == 0) {
+	wp "* Nothing interesting\n";
+	return;
+    }
+
+    # Second pass, print data sorted by IP
+    foreach my $ip (sort bynetwork (keys %list)) {
+	wp "* ",$list{$ip},"\n";
+    }
+}
+
+
+sub do_small_nets {
+    my ($net) = @_;
+
+    my @subn = sort bynetwork (keys %{$contains{$net}});
+
+    if (scalar(@subn)) {
+	# print "Doing small nets of $net: ",join(" ",@subn),"\n";
+
+	wp "\nNetwork $net contains the following small subnets:\n";
+	foreach my $subn (@subn) {
+	    wp "*"," $subn: ".$smallname{$subn}."\n";
+	    delete $smallname{$subn};
+	}
+	wp "\n";
+    }
+
+    wp "\n\n";
+
+    do_axfr($net);
+
+    delete $name{$net};
+}
+
+
+
+sub do_sub_nets {
+    my ($net) = @_;
+
+    if ($net =~ m~/24$~) {
+	# Divert to special case.
+	do_small_nets($net);
+	delete $name{$net};
+	return;
+    }
+
+
+    my @subn = sort bynetwork (keys %{$contains{$net}});
+
+    if (scalar(@subn)) {
+	foreach my $subn (@subn) {
+	    do_sub_nets($subn);
+	}
+    }
+    delete $name{$net};
+}
+
+
+sub wiki_page_generator {
+    my ($net) = @_;
+
+    wp "''Page generated at ".scalar(localtime())."''\n";
+
+    # $name{$net} is gone when do_sub_nets is done.
+    my $pagename = "dnstool $net";
+
+    $pagename .= " ".$name{$net} if defined($name{$net}) and $name{$net};
+
+    do_sub_nets($net);
+
+    wp "[[category:dnstool IP information]]\n";
+
+    $pagename =~ s~/~-~g;
+
+    wiki_shipout($pagename);
+}
+
+
+sub wiki_generator {
+    my $radix;
+
+
+    my @keys = sort bynetwork (keys %name);
+
+    foreach $radix (1..24) {
+	my @nets = grep( m~/$radix$~ , @keys );
+	next unless scalar(@nets);
+
+	foreach (@nets) {
+	    wiki_page_generator($_);
+	}
+	@keys = sort bynetwork (keys %name);
+    }
+}
+
+
+sub get_config {
+    my ($res) = @_;
+
+    my $wikiapi = get_txt($res,'wikiapi.policy.dnstool.') or
+      die "Could not retrieve configuration item wikiapi.policy.dnstool\n";
+
+    my $domain  = get_txt($res,'dnsdomain.policy.dnstool.') or
+      die "Could not retrieve configuration item dnsdomain.policy.dnstool\n";
+
+    my $user  = get_txt($res,'wikiuser.policy.dnstool.') or
+      die "Could not retrieve configuration item wikiuser.policy.dnstool\n";
+
+    my $password  = get_txt($res,'wikipasswd.policy.dnstool.') or
+      die "Could not retrieve configuration item wikipasswd.policy.dnstool\n";
+
+    return ($wikiapi, $domain, $user, $password);
+}
+

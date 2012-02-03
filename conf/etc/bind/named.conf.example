@@ -1,0 +1,6 @@
+zone "example.example" {
+        type master;
+        file "/var/lib/bind/dnstool/example.example";
+        allow-update { localhost; };
+};
+
