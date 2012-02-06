@@ -27,5 +27,5 @@ install:
 	$(INSTALL) -m 0664 -o bind -g bind conf/var/lib/bind/dnstool-rev/198.51.100 $(VARBINDDIR)/dnstool-rev/
 	$(INSTALL) -m 0664 -o bind -g bind conf/var/lib/bind/dnstool-rev/201.0.113 $(VARBINDDIR)/dnstool-rev/
 	$(INSTALL) -m 0664 -o bind -g bind conf/var/lib/bind/dnstool-rev/zones.conf $(VARBINDDIR)/dnstool-rev/
-	@echo "dnstool: Install complete. Now please review your $(ETCCBINDDIR)."
+	@echo "dnstool: Install complete. Now please review your $(ETCBINDDIR)."
 
