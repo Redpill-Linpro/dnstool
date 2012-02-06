@@ -28,10 +28,13 @@ local zones.
 For an example setup using RFC 5737 networks, do a "make install", then add
  include "/etc/bind/named.conf.dnstool";
  include "/etc/bind/named.conf.example";
-to /etc/bind/named.conf
+to /etc/bind/named.conf and do your usual "rndc reconfig" incantation.
 
 The toolmaster configured in "policy.dnstool" needs to be correct in the local
 DNS, or nothing will work. An otherwise-working /etc/hosts override is not enough.
+The example zone has the toolmaster at 192.0.2.5.
+
+/etc/bind/dnstool/empty-zone is the template for new reverse zones, edit to suit.
 
 Config layout: (/var files are updated by scripts or named, /etc is left to the sysadmin)
 
