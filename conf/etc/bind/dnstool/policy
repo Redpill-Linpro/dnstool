@@ -1,6 +1,6 @@
 ; -*- zone -*- <- for emacs
 $TTL 300
-@ SOA dnstooltest.example.example. hostmaster.example.example. 1 3H 15M 4W 300
+@ SOA dnstooltest.example.example. hostmaster.example.example. 2 3H 15M 4W 300
 
                 NS      dnstooltest.example.example.
                 NS      dnstooltest2.example.example.
@@ -12,9 +12,10 @@ router          TXT     "1"
 ;
 ttl             TXT     "300"
 ;
-; Default DNS domain
+; DNS domains
 ;
 dnsdomain       TXT     "example.example."
+dnsdomain       TXT     "extra-example.example."
 ;
 ; Where generated zone files are kept
 ;
