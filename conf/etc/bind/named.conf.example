@@ -4,3 +4,9 @@ zone "example.example" {
         allow-update { localhost; };
 };
 
+zone "extra-example.example" {
+	type master;
+	file "/var/lib/bind/dnstool/extra-example.example";
+	allow-update { localhost; };
+};
+

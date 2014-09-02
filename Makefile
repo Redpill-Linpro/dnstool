@@ -22,6 +22,7 @@ install:
 	$(INSTALL) -m 0644 -o root -g bind conf/etc/bind/dnstool/policy $(ETCBINDDIR)/dnstool/
 	$(INSTALL) -m 0644 -o root -g bind conf/etc/bind/dnstool/empty-zone $(ETCBINDDIR)/dnstool/
 	$(INSTALL) -m 0664 -o bind -g bind conf/var/lib/bind/dnstool/example.example $(VARBINDDIR)/dnstool/
+	$(INSTALL) -m 0664 -o bind -g bind conf/var/lib/bind/dnstool/extra-example.example $(VARBINDDIR)/dnstool/
 	$(INSTALL) -m 0664 -o bind -g bind conf/var/lib/bind/dnstool/networks $(VARBINDDIR)/dnstool/
 	$(INSTALL) -m 0664 -o bind -g bind conf/var/lib/bind/dnstool-rev/192.0.2 $(VARBINDDIR)/dnstool-rev/
 	$(INSTALL) -m 0664 -o bind -g bind conf/var/lib/bind/dnstool-rev/198.51.100 $(VARBINDDIR)/dnstool-rev/
