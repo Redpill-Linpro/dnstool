@@ -66,6 +66,7 @@ my %ops = (
 my $default_ttl;
 my $default_domain;
 my $default_router;
+my @domains;
 
 my $debug = 0;
 
@@ -284,6 +285,29 @@ sub get_txt {
   return undef;
 }
 
+sub get_txt_all {
+  # Get all matching TXT records via the given resolver
+  my ($res) = shift;
+  my ($name) = shift;
+
+  my @result;
+
+  my ($query) = $res->query($name,'TXT');
+
+  unless ($query) {
+    printwarn ("Couldn't look up \"$name\" TXT record\n");
+    return undef;
+  }
+
+  foreach my $rr ($query->answer) {
+    next unless $rr->type eq 'TXT';
+
+    push @result, $rr->txtdata;
+  }
+
+  return sort @result;
+}
+
 sub load_policy {
   my ($res) = shift;
 
@@ -291,7 +315,7 @@ sub load_policy {
   # Net::DNS has a long timeout, die semi-early if something is wrong
   die ("Could not look up router policy, is tool server defined correctly?\n") unless defined ($default_router);
   $default_ttl = get_txt($res,'ttl.policy.dnstool');
-  $default_domain = get_txt($res,'dnsdomain.policy.dnstool');
+  @domains = get_txt_all($res,'dnsdomain.policy.dnstool');
 }
 
 # ############################ Update DNS ##############################
@@ -636,6 +660,35 @@ sub listbox_wizard ($$$$$$$) {
   $cui->delete('listbox_window');
 
   return ($button,$sel);
+}
+
+# ############# Multi domain support: choose domain first
+sub choose_domain ($) {
+  my($argv)=shift;
+  my($server)=shift;
+
+  my @index;
+  my %labels;
+  my $values;
+  my $initfilter = "";
+
+  my $i=0;
+  foreach my $rr (@domains) {
+    $index[$i]=$rr;
+    $labels{$i}=$rr;
+    $i++;
+  }
+  $values = \@index;
+
+  my ($button,$sel) =
+     listbox_wizard(+LIST_SC,\%labels,$values,$initfilter,
+                    "DNS tool: ",
+                    "Choose domain to edit",
+                    "Domain"
+                   );
+
+  $default_domain = $sel;
+  return ($button);
 }
 
 # ############# To Add or to Delete that is the question #############
@@ -1850,7 +1903,8 @@ sub add_wizard ($$) {
   load_policy($server);
 
   @wizlist =
-    (sub { ($progress,$network) = &network_list($argv,$server); },
+    (sub { ($progress) = &choose_domain($argv,$server); },
+     sub { ($progress,$network) = &network_list($argv,$server); },
      sub { ($progress,@values) = # @values = a list of one address to add
 	     &subnet_list_add($argv,$server,$network,$progress); },
      sub { ($progress) =
@@ -1882,7 +1936,8 @@ sub del_wizard {
   load_policy($server);
 
   @wizlist =
-    (sub { ($progress,$network) = &network_list($argv,$server); },
+    (sub { ($progress) = &choose_domain($argv,$server); },
+     sub { ($progress,$network) = &network_list($argv,$server); },
      sub { ($progress,$records) = &list_del($argv,$server,$network); },
      sub { ($progress) = &del_records($argv,$server,$records); } );
 
