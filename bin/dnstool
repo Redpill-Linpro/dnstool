@@ -36,7 +36,7 @@ use subs qw(exit);
 # use utf8;
 
 use constant {
-  # Base opperation, add or delete?
+  # Base operation, add or delete?
   ADD_RR => 1,
   DEL_RR => 2,
 
@@ -44,7 +44,7 @@ use constant {
   ADD_CNAME => -1,
   ADD_OUTSIDE => -2,
 
-  # For deleting. Delete by name? Otherwise by by
+  # For deleting. Delete by name? Otherwise by 
   # IP, PTR only.
   DEL_NAME => -1,
 
@@ -122,7 +122,7 @@ sub printmsg {
   $cui->reset_curses if defined($cui);
 }
 
-# Misc signal and death handeling
+# Misc signal and death handling
 
 $SIG{__DIE__} = $SIG{__WARN__} = \&printwarn;
 
@@ -145,7 +145,7 @@ my $operation;
 my $lines;
 my $cols;
 
-# Instanciate UI library
+# Instantiate UI library
 $cui = new Curses::UI (
 		       -mouse_support => 0,
 		       -clear_on_exit => 0,
@@ -313,7 +313,7 @@ sub update_dns {
   # itself fails.  Either we get the answer or we glean it indirectly
   # from the authority section of the failed answer.  Ask for the SOA
   # of a FQDN hostname (existent or not) and you'll get back a
-  # authority section giving away the dname of the actuall domain that
+  # authority section giving away the dname of the actual domain that
   # needs to be updated.
   my ($query) = $res->send($domname,'SOA','IN');
 
@@ -397,7 +397,7 @@ sub bynetwork {
 
   return $cmp;
 
-  # This is the short version, not to easy to debug.
+  # This is the short version, not too easy to debug.
   # return NetAddr::IP->new($ann) <=> NetAddr::IP->new($bnn);
 }
 
