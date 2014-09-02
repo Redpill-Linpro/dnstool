@@ -1343,7 +1343,7 @@ Press OK to return to the window.");
   }
 
   # User said to continue.  Check quality of input
-  if (! ($hostname =~ /^(?:[a-z0-9][a-z0-9-]*\.?)+$REdomain$/oi)) {
+  if (! ($hostname =~ /^(?:[a-z0-9][a-z0-9-]*\.)+$REdomain$/oi)) {
     $cui->dialog("'$hostname' is not a legal hostname.
 
 Please enter a legal hostname of the form
@@ -1515,7 +1515,7 @@ sub add_record_cname {
   return $button if $button == +WIZ_PREV;
 
   # User said to continue.  Check quality of input
-  if (! ($hostname =~ /^(?:[a-z0-9][a-z0-9-]*\.?)+$REdomain$/oi)) {
+  if (! ($hostname =~ /^(?:[a-z0-9][a-z0-9-]*\.)+$REdomain$/oi)) {
     $cui->dialog("'$hostname' is not a legal hostname.
 
 Please enter a legal hostname of the form
@@ -1689,7 +1689,7 @@ sub add_record_outside_a {
   return $button if $button == +WIZ_PREV;
 
   # User said to continue.  Check quality of input
-  if (! ($hostname =~ /^(?:[a-z0-9][a-z0-9-]*\.?)+$REdomain$/oi)) {
+  if (! ($hostname =~ /^(?:[a-z0-9][a-z0-9-]*\.)+$REdomain$/oi)) {
     $cui->dialog("'$hostname' is not a legal hostname.
 
 Please enter a legal hostname of the form
