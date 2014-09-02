@@ -1827,6 +1827,7 @@ sub del_records {
     my $dom;
     my $rest;
     my $result;
+    my $zone;
     my @failed = ();
     my @done = ();
     my $r;
@@ -1837,8 +1838,18 @@ sub del_records {
 	# Pick out the name, ignore the TTL and then keep the rest
 	($dom,undef,$rest) = split(/\s+/,$r,3);
 	$rest =~ s/\s+/ /g;
+        $zone = $dom;
+	# update delete gnikk.example.example. doesn't work for cnames
+        # when zone is set to gnikk.example.example., only when zone is
+        # set to example.example.
+        # Strangely, deleting A records and PTR records have no such
+        # limitation. BIND/nsupdate bug?
+	if ($rest =~ /^IN CNAME/i)
+        {
+            $zone = $default_domain;
+        }
 	$result =
-	  update_dns($res,$dom,"delete",
+	  update_dns($res,$zone,"delete",
 		     update => rr_del("$dom $rest"));
 	push(@failed,"$dom $rest") if !$result;
 	push(@done,"$dom $rest");
