@@ -1,5 +1,4 @@
 - add autozones scripts (?)
-- Multiple forward zones (please!)
 - IPv6 (AAAA, .ip6.arpa)
 - TXT records (SPF, DKIM, etc)
 - MX records

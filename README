@@ -3,7 +3,7 @@ DNSTOOL README
 PURPOSE
 
 Dnstool is a set of curses-based user interfaces and supporting scripts
-for easy administration of a large dns zone with dozens of reverse zones.
+for easy administration of some dns zones with dozens of reverse zones.
 
 LICENSE
 
@@ -50,6 +50,7 @@ Config layout: (/var files are updated by scripts or named, /etc is left to the 
         └── bind
             ├── dnstool
             │   ├── example.example
+            │   ├── extra-example.example
             │   └── networks
             └── dnstool-rev
                 ├── 192.0.2
@@ -89,6 +90,31 @@ Well, why not?
                │                                                │
                │                                                │
                └────────────────────────────────────────────────┘
+┌ DNS tool:  ──────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  Choose domain to edit                                                       │
+│                                                                              │
+│ ┌ Domain ──────────────────────────────────────────────────────────────────┐ │
+│ │example.example.                                                          │ │
+│ │extra-example.example.                                                    │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ └──────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│ Filter:                                   << Previous   Next >> < Cancel >   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
 ┌ DNS tool: Add an address ────────────────────────────────────────────────────┐
 │                                                                              │
 │  Choose a network                                                            │
@@ -181,8 +207,9 @@ AUTHOR
 Originally commissioned work for Oslo Lufthavn AS (osl.no), open-sourced in 2012.
 
 Copyright 2006,2010 Nicolai Langfeldt, Linpro AS
-Copyright 2012 Erik Inge Bolsø, Redpill Linpro AS
+Copyright 2012,2014 Erik Inge Bolsø, Redpill Linpro AS
 Copyright 2006,2010,2012 Oslo Lufthavn AS
+Copyright 2014 Avinor AS
 
 MAILING LIST
 

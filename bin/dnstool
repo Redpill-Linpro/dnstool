@@ -4,8 +4,9 @@
 #    and user input.  Update is done with DNS-UPDATE
 #
 #    Copyright 2006,2010 Nicolai Langfeldt, Linpro AS
-#    Copyright 2012 Erik Inge Bolsø, Redpill Linpro AS
+#    Copyright 2012,2014 Erik Inge Bolsø, Redpill Linpro AS
 #    Copyright 2006,2010,2012 Oslo Lufthavn AS
+#    Copyright 2014 Avinor AS
 #
 #    This file is part of dnstool.
 #
