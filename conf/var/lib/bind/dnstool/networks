@@ -13,9 +13,9 @@ networks.dnstool        IN SOA  dnstooltest.example.example. hostmaster.example.
 $ORIGIN 0.networks.dnstool.
 router.192.0.2          A       192.0.2.1
 router.198.51.100       A       198.51.100.1
-router.201.0.113        A       201.0.113.1
+router.203.0.113        A       203.0.113.1
 $ORIGIN 0/24.networks.dnstool.
 192.0.2                 TXT     "TEST-NET-1"
 198.51.100              TXT     "TEST-NET-2"
-201.0.113               TXT     "TEST-NET-3"
+203.0.113               TXT     "TEST-NET-3"
 
